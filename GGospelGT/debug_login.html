@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug Login</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            max-width: 800px; 
+            margin: 0 auto; 
+            padding: 20px; 
+        }
+        .test-result { 
+            margin: 20px 0; 
+            padding: 15px; 
+            border: 1px solid #ccc; 
+            border-radius: 5px; 
+        }
+        .success { background-color: #d4edda; border-color: #c3e6cb; }
+        .error { background-color: #f8d7da; border-color: #f5c6cb; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <h1>Login Debug Console</h1>
+    <div id="results"></div>
+    
+    <script>
+        const resultsDiv = document.getElementById('results');
+        
+        function addResult(title, success, content) {
+            const div = document.createElement('div');
+            div.className = `test-result ${success ? 'success' : 'error'}`;
+            div.innerHTML = `
+                <h3>${success ? '✅' : '❌'} ${title}</h3>
+                <pre>${content}</pre>
+            `;
+            resultsDiv.appendChild(div);
+        }
+        
+        async function testDirectAPI() {
+            try {
+                const response = await fetch('http://localhost:8001/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        email: 'francisdaniel4jb@gmail.com',
+                        password: 'FixedPassword123!'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    addResult('Direct API Test', true, `
+Status: ${response.status}
+Response: ${JSON.stringify(data, null, 2)}
+                    `);
+                } else {
+                    addResult('Direct API Test', false, `
+Status: ${response.status}
+Error: ${JSON.stringify(data, null, 2)}
+                    `);
+                }
+            } catch (error) {
+                addResult('Direct API Test', false, `
+Network Error: ${error.message}
+Stack: ${error.stack}
+                `);
+            }
+        }
+        
+        async function testWithAxiosLike() {
+            try {
+                // Simulate what the frontend API client does
+                const response = await fetch('http://localhost:8001/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        email: 'francisdaniel4jb@gmail.com',
+                        password: 'FixedPassword123!'
+                    })
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`HTTP ${response.status}: ${JSON.stringify(errorData)}`);
+                }
+                
+                const data = await response.json();
+                addResult('Axios-like Test', true, `
+Status: ${response.status}
+Data: ${JSON.stringify(data, null, 2)}
+                `);
+                
+                // Test storing the token like the frontend does
+                if (data.access_token) {
+                    localStorage.setItem('debug_token', data.access_token);
+                    addResult('Token Storage', true, `Token stored successfully: ${data.access_token.substring(0, 50)}...`);
+                }
+                
+            } catch (error) {
+                addResult('Axios-like Test', false, `
+Error: ${error.message}
+                `);
+            }
+        }
+        
+        async function testTokenValidation() {
+            const token = localStorage.getItem('debug_token');
+            if (!token) {
+                addResult('Token Validation', false, 'No token found in localStorage');
+                return;
+            }
+            
+            try {
+                const response = await fetch('http://localhost:8001/api/auth/me', {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json',
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    addResult('Token Validation', true, `
+Status: ${response.status}
+User Data: ${JSON.stringify(data, null, 2)}
+                    `);
+                } else {
+                    addResult('Token Validation', false, `
+Status: ${response.status}
+Error: ${JSON.stringify(data, null, 2)}
+                    `);
+                }
+            } catch (error) {
+                addResult('Token Validation', false, `
+Network Error: ${error.message}
+                `);
+            }
+        }
+        
+        // Run all tests
+        async function runAllTests() {
+            addResult('Test Start', true, `Starting login debug tests at ${new Date().toISOString()}`);
+            
+            await testDirectAPI();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            await testWithAxiosLike();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            await testTokenValidation();
+            
+            addResult('Test Complete', true, `All tests completed at ${new Date().toISOString()}`);
+        }
+        
+        runAllTests();
+    </script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+services:
+  # Frontend Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_BACKEND_URL=http://localhost:8001
+      - REACT_APP_GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+    depends_on:
+      - backend
+    networks:
+      - servicehub-network
+
+  # Backend Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    env_file:
+      - ./backend/.env
+    environment:
+      - TERMII_API_KEY=${TERMII_API_KEY}
+      - SENDGRID_API_KEY=${SENDGRID_API_KEY}
+      - SENDER_EMAIL=${SENDER_EMAIL}
+      - CORS_ORIGINS=http://localhost:3000
+    volumes:
+      - ./backend:/app/backend
+    networks:
+      - servicehub-network
+
+networks:
+  servicehub-network:
+    driver: bridge

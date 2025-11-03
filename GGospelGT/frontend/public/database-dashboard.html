@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ServiceHub Database Dashboard</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 5px solid #007bff;
+        }
+        .stat-card h3 {
+            margin: 0 0 10px 0;
+            color: #007bff;
+        }
+        .stat-number {
+            font-size: 2em;
+            font-weight: bold;
+            color: #333;
+        }
+        .data-section {
+            margin: 30px 0;
+            padding: 20px;
+            background: #fff;
+            border-radius: 10px;
+            border: 1px solid #e9ecef;
+        }
+        .data-section h2 {
+            color: #495057;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+        }
+        pre {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            border-left: 4px solid #28a745;
+            font-size: 0.9em;
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #6c757d;
+        }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 4px solid #dc3545;
+        }
+        .refresh-btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+            margin: 10px 0;
+            transition: background 0.3s;
+        }
+        .refresh-btn:hover {
+            background: #0056b3;
+        }
+        .timestamp {
+            text-align: center;
+            color: #6c757d;
+            font-style: italic;
+            margin-top: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border: 1px solid #dee2e6;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+        }
+        .status-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            color: white;
+            font-size: 0.8em;
+            font-weight: 500;
+        }
+        .status-active { background: #28a745; }
+        .status-completed { background: #007bff; }
+        .status-pending { background: #ffc107; color: #000; }
+        .status-cancelled { background: #dc3545; }
+        .role-tradesperson { background: #28a745; }
+        .role-homeowner { background: #007bff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🗄️ ServiceHub Database Dashboard</h1>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>👥 Total Users</h3>
+                <div class="stat-number" id="totalUsers">Loading...</div>
+            </div>
+            <div class="stat-card">
+                <h3>🏠 Homeowners</h3>
+                <div class="stat-number" id="homeowners">Loading...</div>
+            </div>
+            <div class="stat-card">
+                <h3>🔧 Tradespeople</h3>
+                <div class="stat-number" id="tradespeople">Loading...</div>
+            </div>
+            <div class="stat-card">
+                <h3>💼 Total Jobs</h3>
+                <div class="stat-number" id="totalJobs">Loading...</div>
+            </div>
+            <div class="stat-card">
+                <h3>✅ Active Jobs</h3>
+                <div class="stat-number" id="activeJobs">Loading...</div>
+            </div>
+            <div class="stat-card">
+                <h3>⭐ Reviews</h3>
+                <div class="stat-number" id="totalReviews">Loading...</div>
+            </div>
+        </div>
+
+        <button class="refresh-btn" onclick="loadAllData()">🔄 Refresh Data</button>
+
+        <div class="data-section">
+            <h2>👥 Recent Users</h2>
+            <div id="recentUsers" class="loading">Loading recent users...</div>
+        </div>
+
+        <div class="data-section">
+            <h2>💼 Recent Jobs</h2>
+            <div id="recentJobs" class="loading">Loading recent jobs...</div>
+        </div>
+
+        <div class="data-section">
+            <h2>📊 Database Collections</h2>
+            <div id="databaseCollections" class="loading">Loading collections info...</div>
+        </div>
+
+        <div class="timestamp" id="lastUpdated"></div>
+    </div>
+
+    <script>
+        const API_BASE = '/api';
+        
+        async function fetchData(endpoint) {
+            try {
+                const response = await fetch(`${API_BASE}/${endpoint}`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return await response.json();
+            } catch (error) {
+                console.error(`Error fetching ${endpoint}:`, error);
+                return { error: error.message };
+            }
+        }
+
+        function formatDate(dateString) {
+            if (!dateString) return 'N/A';
+            try {
+                return new Date(dateString).toLocaleDateString() + ' ' + 
+                       new Date(dateString).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } catch {
+                return dateString;
+            }
+        }
+
+        async function loadUsersData() {
+            const data = await fetchData('users-summary');
+            
+            if (data.error) {
+                document.getElementById('totalUsers').textContent = 'Error';
+                document.getElementById('recentUsers').innerHTML = `<div class="error">Error loading users: ${data.error}</div>`;
+                return;
+            }
+
+            // Update stats
+            document.getElementById('totalUsers').textContent = data.total_users || 'N/A';
+            document.getElementById('homeowners').textContent = data.homeowners || 'N/A';
+            document.getElementById('tradespeople').textContent = data.tradespeople || 'N/A';
+
+            // Show recent users
+            const recentElement = document.getElementById('recentUsers');
+            if (data.recent_users && data.recent_users.length > 0) {
+                let html = '<table><tr><th>Name</th><th>Email</th><th>Role</th><th>Created</th></tr>';
+                
+                data.recent_users.forEach(user => {
+                    html += `<tr>
+                        <td>${user.name || 'N/A'}</td>
+                        <td>${user.email || 'N/A'}</td>
+                        <td><span class="status-badge role-${user.role}">${user.role}</span></td>
+                        <td>${formatDate(user.created_at)}</td>
+                    </tr>`;
+                });
+                html += '</table>';
+                recentElement.innerHTML = html;
+            } else {
+                recentElement.innerHTML = '<p>No recent users found.</p>';
+            }
+        }
+
+        async function loadJobsData() {
+            const data = await fetchData('jobs-summary');
+            
+            if (data.error) {
+                document.getElementById('totalJobs').textContent = 'Error';
+                document.getElementById('recentJobs').innerHTML = `<div class="error">Error loading jobs: ${data.error}</div>`;
+                return;
+            }
+
+            // Update stats
+            document.getElementById('totalJobs').textContent = data.total_jobs || 'N/A';
+            document.getElementById('activeJobs').textContent = data.active_jobs || 'N/A';
+
+            // Show recent jobs
+            const recentElement = document.getElementById('recentJobs');
+            if (data.recent_jobs && data.recent_jobs.length > 0) {
+                let html = '<table><tr><th>Title</th><th>Category</th><th>Location</th><th>Status</th><th>Created</th></tr>';
+                
+                data.recent_jobs.forEach(job => {
+                    html += `<tr>
+                        <td>${job.title || 'N/A'}</td>
+                        <td>${job.category || 'N/A'}</td>
+                        <td>${job.location || 'N/A'}</td>
+                        <td><span class="status-badge status-${job.status}">${job.status}</span></td>
+                        <td>${formatDate(job.created_at)}</td>
+                    </tr>`;
+                });
+                html += '</table>';
+                recentElement.innerHTML = html;
+            } else {
+                recentElement.innerHTML = '<p>No recent jobs found.</p>';
+            }
+        }
+
+        async function loadDatabaseInfo() {
+            const data = await fetchData('database-info');
+            const element = document.getElementById('databaseCollections');
+            
+            if (data.error) {
+                element.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+                return;
+            }
+
+            // Update reviews stat
+            document.getElementById('totalReviews').textContent = data.collections?.reviews || 'N/A';
+            
+            // Show collections info
+            if (data.collections) {
+                let html = '<table><tr><th>Collection</th><th>Count</th></tr>';
+                Object.entries(data.collections).forEach(([name, count]) => {
+                    if (name !== 'error') {
+                        html += `<tr><td>${name}</td><td><strong>${count}</strong></td></tr>`;
+                    }
+                });
+                html += '</table>';
+                
+                if (data.sample_data) {
+                    html += '<h3 style="margin-top: 20px;">Sample Data</h3>';
+                    html += `<pre>${JSON.stringify(data.sample_data, null, 2)}</pre>`;
+                }
+                
+                element.innerHTML = html;
+            } else {
+                element.innerHTML = '<p>No collections data available.</p>';
+            }
+        }
+
+        async function loadAllData() {
+            const startTime = Date.now();
+            
+            // Show loading state
+            document.querySelectorAll('.stat-number').forEach(el => el.textContent = 'Loading...');
+            
+            try {
+                await Promise.all([
+                    loadUsersData(),
+                    loadJobsData(),
+                    loadDatabaseInfo()
+                ]);
+                
+                const loadTime = Date.now() - startTime;
+                document.getElementById('lastUpdated').textContent = 
+                    `🕒 Last updated: ${new Date().toLocaleString()} (${loadTime}ms)`;
+                    
+            } catch (error) {
+                console.error('Error loading data:', error);
+                document.getElementById('lastUpdated').textContent = 
+                    `❌ Error loading data: ${error.message}`;
+            }
+        }
+
+        // Load data when page loads
+        document.addEventListener('DOMContentLoaded', loadAllData);
+        
+        // Auto-refresh every 60 seconds
+        setInterval(loadAllData, 60000);
+    </script>
+</body>
+</html>

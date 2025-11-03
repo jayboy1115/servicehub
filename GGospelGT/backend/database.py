@@ -1,0 +1,6132 @@
+from motor.motor_asyncio import AsyncIOMotorClient
+from datetime import datetime, timedelta
+import os
+from typing import List, Optional, Dict, Any
+import logging
+import uuid
+import certifi
+try:
+    from .models.notifications import (
+        Notification, NotificationPreferences, NotificationChannel,
+        NotificationType, NotificationStatus
+    )
+    from .models.reviews import (
+        Review, ReviewCreate, ReviewSummary, ReviewRequest, 
+        ReviewStats, ReviewType, ReviewStatus
+    )
+    from .models.admin import AdminRole, AdminStatus, AdminActivityType
+except ImportError:
+    from models.notifications import (
+        Notification, NotificationPreferences, NotificationChannel,
+        NotificationType, NotificationStatus
+    )
+    from models.reviews import (
+        Review, ReviewCreate, ReviewSummary, ReviewRequest, 
+        ReviewStats, ReviewType, ReviewStatus
+    )
+    from models.admin import AdminRole, AdminStatus, AdminActivityType
+
+logger = logging.getLogger(__name__)
+
+class Database:
+    def __init__(self):
+        self.client = None
+        self.database = None
+        self.connected = False
+
+    async def connect_to_mongo(self):
+        # Try different environment variable names for MongoDB URL
+        mongo_url = os.environ.get('MONGO_URL') or os.environ.get('MONGODB_URL')
+        db_name = os.environ.get('DB_NAME') or os.environ.get('DATABASE_NAME') or 'servicehub'
+        
+        if not mongo_url:
+            raise ValueError("MongoDB URL not found. Please set MONGO_URL or MONGODB_URL environment variable.")
+        
+        # Initialize client with TLS CA file to fix SSL handshake issues and sensible timeouts
+        timeout_ms = int(os.getenv('MONGO_TIMEOUT_MS', '15000'))
+        connect_timeout_ms = int(os.getenv('MONGO_CONNECT_TIMEOUT_MS', '15000'))
+        # Create SSL context pinned to TLS 1.2 with Certifi CA bundle
+        import ssl
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        try:
+            # Prefer TLS 1.2 for compatibility with certain Atlas clusters
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_context.maximum_version = ssl.TLSVersion.TLSv1_2
+        except Exception:
+            # Fallback for older Python versions that don't support TLSVersion enum
+            pass
+
+        url_lower = mongo_url.lower()
+        use_tls = mongo_url.startswith("mongodb+srv://") or ("tls=true" in url_lower) or ("ssl=true" in url_lower)
+        insecure_via_uri = "tlsinsecure=true" in url_lower
+        insecure_via_params = ("tlsallowinvalidcertificates=true" in url_lower) or ("tlsallowinvalidhostnames=true" in url_lower)
+        try:
+            client_kwargs = {
+                "serverSelectionTimeoutMS": timeout_ms,
+                "connectTimeoutMS": connect_timeout_ms,
+            }
+            if use_tls:
+                client_kwargs["tls"] = True
+                if insecure_via_uri or insecure_via_params:
+                    # When URI already includes insecure flags, do not set conflicting client params
+                    # Also avoid tlsCAFile to prevent certificate validation
+                    pass
+                else:
+                    client_kwargs["tlsCAFile"] = certifi.where()
+            
+            # Initialize the client
+            self.client = AsyncIOMotorClient(
+                mongo_url,
+                **client_kwargs,
+            )
+            
+            # Verify connection with a ping
+            await self.client.admin.command('ping')
+            self.database = self.client[db_name]
+            self.connected = True
+            logger.info("Connected to MongoDB")
+            # Ensure required indexes at startup
+            try:
+                # Users: unique email index
+                await self.database.users.create_index(
+                    [("email", 1)],
+                    name="unique_email",
+                    unique=True,
+                    partialFilterExpression={"email": {"$type": "string"}}
+                )
+
+                # Jobs: compound indexes to optimize common queries and sorts
+                await self.database.jobs.create_index(
+                    [("status", 1), ("created_at", -1)],
+                    name="jobs_status_createdAt"
+                )
+                await self.database.jobs.create_index(
+                    [("homeowner_id", 1), ("created_at", -1)],
+                    name="jobs_homeownerId_createdAt"
+                )
+                await self.database.jobs.create_index(
+                    [("homeowner.id", 1), ("created_at", -1)],
+                    name="jobs_homeownerDotId_createdAt"
+                )
+                await self.database.jobs.create_index(
+                    [("category", 1), ("created_at", -1)],
+                    name="jobs_category_createdAt"
+                )
+
+                # Messages: indexes for conversation queries and read-status updates
+                await self.database.messages.create_index(
+                    [("conversation_id", 1), ("created_at", 1)],
+                    name="messages_conversation_createdAt"
+                )
+                await self.database.messages.create_index(
+                    [("conversation_id", 1), ("sender_type", 1), ("status", 1)],
+                    name="messages_conversation_sender_status"
+                )
+                logger.info("Database indexes ensured successfully")
+            except Exception as e:
+                logger.error(f"Failed to ensure database indexes: {e}")
+        except Exception as e:
+            self.connected = False
+            logger.error(f"MongoDB connection failed: {e}")
+            # Allow app to continue running without database connection
+
+    async def close_mongo_connection(self):
+        if self.client:
+            self.client.close()
+            logger.info("MongoDB connection closed")
+
+    @property
+    def portfolio_collection(self):
+        """Access to portfolio collection"""
+        return self.database.portfolio
+
+    @property
+    def users_collection(self):
+        """Access to users collection"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: users collection not accessible")
+        return self.database.users
+
+    # User authentication operations
+    async def create_user(self, user_data: dict) -> dict:
+        """Create a new user"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot create user")
+        result = await self.database.users.insert_one(user_data)
+        user_data['_id'] = str(result.inserted_id)
+        return user_data
+
+    async def get_user_by_id(self, user_id: str) -> Optional[dict]:
+        """Get user by ID"""
+        if self.database is None:
+            return None
+        user = await self.database.users.find_one({"id": user_id})
+        if user:
+            user['_id'] = str(user['_id'])
+        return user
+
+    async def get_user_by_email(self, email: str) -> Optional[dict]:
+        """Get user by email"""
+        if self.database is None:
+            return None
+        user = await self.database.users.find_one({"email": email})
+        if user:
+            user['_id'] = str(user['_id'])
+        return user
+
+    async def update_user(self, user_id: str, update_data: dict) -> bool:
+        """Update user data"""
+        update_data['updated_at'] = datetime.utcnow()
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot update user")
+        result = await self.database.users.update_one(
+            {"id": user_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
+
+    async def update_user_last_login(self, user_id: str):
+        """Update user's last login timestamp"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot update last login")
+        await self.database.users.update_one(
+            {"id": user_id},
+            {"$set": {"last_login": datetime.utcnow()}}
+        )
+
+    async def verify_user_email(self, user_id: str):
+        """Mark user email as verified"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot verify user email")
+        await self.database.users.update_one(
+            {"id": user_id},
+            {"$set": {"email_verified": True, "updated_at": datetime.utcnow()}}
+        )
+
+    # Job operations
+    async def create_job(self, job_data: dict) -> dict:
+        # Set expiration date (30 days from now)
+        job_data['expires_at'] = datetime.utcnow() + timedelta(days=30)
+        result = await self.database.jobs.insert_one(job_data)
+        job_data['_id'] = str(result.inserted_id)
+        return job_data
+    
+    async def update_job(self, job_id: str, update_data: dict) -> bool:
+        """Update a job by ID"""
+        try:
+            result = await self.database.jobs.update_one(
+                {"id": job_id},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating job: {e}")
+            return False
+
+    async def get_job_by_id(self, job_id: str) -> Optional[dict]:
+        job = await self.database.jobs.find_one({"id": job_id})
+        if job:
+            job['_id'] = str(job['_id'])
+        return job
+
+    async def get_jobs(self, skip: int = 0, limit: int = 10, filters: dict = None) -> List[dict]:
+        query = filters or {}
+        
+        # Only return active jobs by default for public queries
+        # Don't apply default filters for homeowner's own jobs (My Jobs queries)
+        is_homeowner_query = 'homeowner.email' in query or 'homeowner_id' in query
+        
+        if not is_homeowner_query:
+            # For public job listings, only show active and non-expired jobs
+            if 'status' not in query:
+                query['status'] = 'active'
+            query['expires_at'] = {'$gt': datetime.utcnow()}
+        
+        cursor = self.database.jobs.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        jobs = await cursor.to_list(length=limit)
+        
+        for job in jobs:
+            job['_id'] = str(job['_id'])
+        return jobs
+
+    # ==========================================
+    # ADMIN JOB MANAGEMENT METHODS
+    # ==========================================
+
+    async def get_all_jobs_admin(self, skip: int = 0, limit: int = 50, status: str = None) -> List[dict]:
+        """Get all jobs for admin management with comprehensive details"""
+        query = {}
+        if status:
+            query["status"] = status
+        
+        # Include soft-deleted jobs for admin (where deleted_at exists)
+        cursor = self.database.jobs.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        
+        jobs = []
+        async for job in cursor:
+            job["_id"] = str(job["_id"])
+            
+            # Get homeowner details
+            if "homeowner_id" in job:
+                homeowner = await self.database.users.find_one({"id": job["homeowner_id"]})
+                if homeowner:
+                    job["homeowner"] = {
+                        "id": homeowner["id"],
+                        "name": homeowner.get("name", "Unknown"),
+                        "email": homeowner.get("email", ""),
+                        "phone": homeowner.get("phone", "")
+                    }
+                else:
+                    job["homeowner"] = {
+                        "id": job.get("homeowner_id", "unknown"),
+                        "name": "Unknown",
+                        "email": "",
+                        "phone": ""
+                    }
+            else:
+                # Handle legacy jobs without homeowner_id
+                job["homeowner"] = {
+                    "id": "unknown",
+                    "name": job.get("homeowner_name", "Unknown"),
+                    "email": job.get("homeowner_email", ""),
+                    "phone": job.get("homeowner_phone", "")
+                }
+            
+            # Get interests count
+            interests_count = await self.database.interests.count_documents({"job_id": job["id"]})
+            job["interests_count"] = interests_count
+            
+            # Set default access fees if not present
+            if "access_fee_naira" not in job:
+                job["access_fee_naira"] = 1000
+                job["access_fee_coins"] = 10
+            
+            jobs.append(job)
+        
+        return jobs
+
+    async def get_pending_jobs_admin(self, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get jobs pending admin approval"""
+        query = {"status": "pending_approval"}
+        
+        cursor = self.database.jobs.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        
+        jobs = []
+        async for job in cursor:
+            job["_id"] = str(job["_id"])
+            
+            # Get homeowner details - check multiple possible sources
+            homeowner_id = None
+            homeowner_info = None
+            
+            # First, check if homeowner_id exists at root level
+            if "homeowner_id" in job:
+                homeowner_id = job["homeowner_id"]
+                homeowner = await self.database.users.find_one({"id": homeowner_id})
+                if homeowner:
+                    homeowner_info = {
+                        "id": homeowner["id"],
+                        "name": homeowner.get("name", "Unknown"),
+                        "email": homeowner.get("email", ""),
+                        "phone": homeowner.get("phone", "")
+                    }
+                    homeowner_info["verification_status"] = homeowner.get("verification_status", "pending")
+                    homeowner_info["join_date"] = homeowner.get("created_at")
+                    # Count total jobs for this homeowner
+                    homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                        "$or": [
+                            {"homeowner_id": homeowner_id},
+                            {"homeowner.id": homeowner_id}
+                        ]
+                    })
+            
+            # If no homeowner_id at root, check if homeowner object exists
+            elif "homeowner" in job and isinstance(job["homeowner"], dict):
+                homeowner_obj = job["homeowner"]
+                homeowner_id = homeowner_obj.get("id")
+                
+                if homeowner_id and homeowner_id != "unknown":
+                    # Try to get updated user info from users collection
+                    homeowner = await self.database.users.find_one({"id": homeowner_id})
+                    if homeowner:
+                        homeowner_info = {
+                            "id": homeowner["id"],
+                            "name": homeowner.get("name", homeowner_obj.get("name", "Unknown")),
+                            "email": homeowner.get("email", homeowner_obj.get("email", "")),
+                            "phone": homeowner.get("phone", homeowner_obj.get("phone", ""))
+                        }
+                        homeowner_info["verification_status"] = homeowner.get("verification_status", "pending")
+                        homeowner_info["join_date"] = homeowner.get("created_at")
+                        # Count total jobs for this homeowner
+                        homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                            "$or": [
+                                {"homeowner_id": homeowner_id},
+                                {"homeowner.id": homeowner_id}
+                            ]
+                        })
+                    else:
+                        # Use the embedded homeowner data
+                        homeowner_info = {
+                            "id": homeowner_obj.get("id", "unknown"),
+                            "name": homeowner_obj.get("name", "Unknown"),
+                            "email": homeowner_obj.get("email", ""),
+                            "phone": homeowner_obj.get("phone", "")
+                        }
+                        homeowner_info["verification_status"] = "pending"
+                        homeowner_info["join_date"] = job.get("created_at")
+                        # Count total jobs for this homeowner
+                        homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                            "$or": [
+                                {"homeowner_id": homeowner_id},
+                                {"homeowner.id": homeowner_id}
+                            ]
+                        })
+                else:
+                    # Use the embedded homeowner data as fallback
+                    homeowner_info = {
+                        "id": homeowner_obj.get("id", "unknown"),
+                        "name": homeowner_obj.get("name", "Unknown"),
+                        "email": homeowner_obj.get("email", ""),
+                        "phone": homeowner_obj.get("phone", ""),
+                        "verification_status": "pending",
+                        "join_date": job.get("created_at"),
+                        "total_jobs": 1  # At least this job
+                    }
+            
+            # If still no homeowner info found, use legacy fields or defaults
+            if not homeowner_info:
+                homeowner_info = {
+                    "id": "unknown",
+                    "name": job.get("homeowner_name", "Unknown"),
+                    "email": job.get("homeowner_email", ""),
+                    "phone": job.get("homeowner_phone", ""),
+                    "verification_status": "pending",
+                    "join_date": job.get("created_at"),
+                    "total_jobs": 0
+                }
+            
+            # Set the homeowner info in the job
+            job["homeowner"] = homeowner_info
+            
+            jobs.append(job)
+        
+        return jobs
+
+    async def get_pending_jobs_count(self) -> int:
+        """Get count of jobs pending approval"""
+        return await self.database.jobs.count_documents({"status": "pending_approval"})
+
+    async def update_job_approval_status(self, job_id: str, approval_data: dict) -> bool:
+        """Update job approval status with admin details"""
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": approval_data}
+        )
+        return result.modified_count > 0
+
+    async def update_job_admin(self, job_id: str, update_data: dict) -> bool:
+        """Update job details (admin only)"""
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
+
+    async def get_job_interests_count(self, job_id: str) -> int:
+        """Get count of interests for a specific job"""
+        return await self.database.interests.count_documents({"job_id": job_id})
+
+    async def count_homeowner_jobs(self, homeowner_id: str) -> int:
+        """Count total jobs posted by a homeowner"""
+        return await self.database.jobs.count_documents({"homeowner.id": homeowner_id})
+
+    async def get_jobs_statistics_admin(self) -> dict:
+        """Get comprehensive job statistics for admin dashboard"""
+        pipeline = [
+            {
+                "$group": {
+                    "_id": None,
+                    "total_jobs": {"$sum": 1},
+                    "pending_jobs": {"$sum": {"$cond": [{"$eq": ["$status", "pending_approval"]}, 1, 0]}},
+                    "active_jobs": {"$sum": {"$cond": [{"$eq": ["$status", "active"]}, 1, 0]}},
+                    "rejected_jobs": {"$sum": {"$cond": [{"$eq": ["$status", "rejected"]}, 1, 0]}},
+                    "expired_jobs": {"$sum": {"$cond": [{"$eq": ["$status", "expired"]}, 1, 0]}},
+                    "completed_jobs": {"$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 1, 0]}}
+                }
+            }
+        ]
+        
+        result = await self.database.jobs.aggregate(pipeline).to_list(1)
+        
+        if result:
+            stats = result[0]
+            
+            # Get today's approvals and rejections
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            
+            approved_today = await self.database.jobs.count_documents({
+                "status": "active",
+                "approved_at": {"$gte": today_start, "$lt": today_end}
+            })
+            
+            rejected_today = await self.database.jobs.count_documents({
+                "status": "rejected", 
+                "approved_at": {"$gte": today_start, "$lt": today_end}
+            })
+            
+            stats["approved_today"] = approved_today
+            stats["rejected_today"] = rejected_today
+            
+            return stats
+        else:
+            return {
+                "total_jobs": 0,
+                "pending_jobs": 0,
+                "active_jobs": 0,
+                "rejected_jobs": 0,
+                "expired_jobs": 0,
+                "completed_jobs": 0,
+                "approved_today": 0,
+                "rejected_today": 0
+            }
+
+    async def get_jobs_count_admin(self, status: str = None) -> int:
+        """Get total count of jobs for pagination"""
+        query = {}
+        if status:
+            query["status"] = status
+        
+        return await self.database.jobs.count_documents(query)
+
+    async def get_job_by_id_admin(self, job_id: str) -> Optional[dict]:
+        """Get job details by ID for admin editing"""
+        job = await self.database.jobs.find_one({"id": job_id})
+        if not job:
+            return None
+        
+        job["_id"] = str(job["_id"])
+        
+        # Get homeowner details
+        if "homeowner_id" in job:
+            homeowner = await self.database.users.find_one({"id": job["homeowner_id"]})
+            if homeowner:
+                job["homeowner"] = {
+                    "id": homeowner["id"],
+                    "name": homeowner.get("name", "Unknown"),
+                    "email": homeowner.get("email", ""),
+                    "phone": homeowner.get("phone", "")
+                }
+            else:
+                job["homeowner"] = {
+                    "id": job.get("homeowner_id", "unknown"),
+                    "name": "Unknown",
+                    "email": "",
+                    "phone": ""
+                }
+        else:
+            # Handle legacy jobs without homeowner_id
+            job["homeowner"] = {
+                "id": "unknown",
+                "name": job.get("homeowner_name", "Unknown"),
+                "email": job.get("homeowner_email", ""),
+                "phone": job.get("homeowner_phone", "")
+            }
+        
+        # Get interests count and details
+        interests_count = await self.database.interests.count_documents({"job_id": job["id"]})
+        job["interests_count"] = interests_count
+        
+        # Get interested tradespeople
+        interests_cursor = self.database.interests.find({"job_id": job["id"]})
+        interested_tradespeople = []
+        async for interest in interests_cursor:
+            tradesperson = await self.database.users.find_one({"id": interest["tradesperson_id"]})
+            if tradesperson:
+                interested_tradespeople.append({
+                    "interest_id": interest["id"],
+                    "tradesperson_name": tradesperson.get("name", "Unknown"),
+                    "tradesperson_email": tradesperson.get("email", ""),
+                    "status": interest.get("status", "pending"),
+                    "created_at": interest.get("created_at")
+                })
+        
+        job["interested_tradespeople"] = interested_tradespeople
+        
+        return job
+
+    async def update_job_admin(self, job_id: str, job_data: dict) -> bool:
+        """Update job details (admin only)"""
+        # Prepare update data
+        update_data = {}
+        allowed_fields = [
+            "title", "description", "category", "location", "state", "lga", 
+            "town", "zip_code", "home_address", "timeline", "budget_min", 
+            "budget_max", "access_fee_naira", "access_fee_coins", "status"
+        ]
+        
+        for field in allowed_fields:
+            if field in job_data:
+                update_data[field] = job_data[field]
+        
+        # Add update timestamp
+        update_data["updated_at"] = datetime.utcnow()
+        
+        if not update_data:
+            return False
+        
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": update_data}
+        )
+        
+        return result.modified_count > 0
+
+    async def update_job_status_admin(self, job_id: str, status: str) -> bool:
+        """Update job status (admin only)"""
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": {
+                "status": status,
+                "updated_at": datetime.utcnow()
+            }}
+        )
+        
+        return result.modified_count > 0
+
+    async def soft_delete_job_admin(self, job_id: str) -> bool:
+        """Soft delete job (admin only)"""
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": {
+                "status": "deleted",
+                "deleted_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }}
+        )
+        
+        return result.modified_count > 0
+
+    async def get_jobs_statistics_admin(self) -> dict:
+        """Get comprehensive job statistics for admin dashboard"""
+        # Total jobs count
+        total_jobs = await self.database.jobs.count_documents({})
+        
+        # Jobs by status
+        active_jobs = await self.database.jobs.count_documents({"status": "active"})
+        completed_jobs = await self.database.jobs.count_documents({"status": "completed"})
+        cancelled_jobs = await self.database.jobs.count_documents({"status": "cancelled"})
+        expired_jobs = await self.database.jobs.count_documents({"status": "expired"})
+        
+        # Total interests
+        total_interests = await self.database.interests.count_documents({})
+        
+        # Jobs with most interests (top 10)
+        pipeline = [
+            {"$group": {
+                "_id": "$job_id",
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"count": -1}},
+            {"$limit": 10}
+        ]
+        top_jobs_interests = await self.database.interests.aggregate(pipeline).to_list(length=10)
+        
+        # Jobs created in last 30 days
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        recent_jobs = await self.database.jobs.count_documents({
+            "created_at": {"$gte": thirty_days_ago}
+        })
+        
+        # Average budget ranges
+        pipeline = [
+            {"$match": {"budget_min": {"$exists": True}, "budget_max": {"$exists": True}}},
+            {"$group": {
+                "_id": None,
+                "avg_min": {"$avg": "$budget_min"},
+                "avg_max": {"$avg": "$budget_max"}
+            }}
+        ]
+        budget_stats = await self.database.jobs.aggregate(pipeline).to_list(length=1)
+        avg_budget_min = budget_stats[0]["avg_min"] if budget_stats else 0
+        avg_budget_max = budget_stats[0]["avg_max"] if budget_stats else 0
+        
+        return {
+            "total_jobs": total_jobs,
+            "active_jobs": active_jobs,
+            "completed_jobs": completed_jobs,
+            "cancelled_jobs": cancelled_jobs,
+            "expired_jobs": expired_jobs,
+            "total_interests": total_interests,
+            "top_jobs_interests": top_jobs_interests,
+            "recent_jobs": recent_jobs,
+            "avg_budget_min": avg_budget_min,
+            "avg_budget_max": avg_budget_max
+        }
+
+    async def get_jobs_count(self, filters: dict = None) -> int:
+        query = filters or {}
+        
+        # Only return active jobs by default for public queries
+        # Don't apply default filters for homeowner's own jobs (My Jobs queries)
+        is_homeowner_query = 'homeowner.email' in query or 'homeowner_id' in query
+        
+        if not is_homeowner_query:
+            # For public job listings, only show active and non-expired jobs
+            if 'status' not in query:
+                query['status'] = 'active'
+            query['expires_at'] = {'$gt': datetime.utcnow()}
+            
+        return await self.database.jobs.count_documents(query)
+
+    async def update_job_quotes_count(self, job_id: str):
+        quotes_count = await self.database.quotes.count_documents({"job_id": job_id})
+        await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": {"quotes_count": quotes_count, "updated_at": datetime.utcnow()}}
+        )
+
+    # Tradesperson operations
+    async def create_tradesperson(self, tradesperson_data: dict) -> dict:
+        result = await self.database.tradespeople.insert_one(tradesperson_data)
+        tradesperson_data['_id'] = str(result.inserted_id)
+        return tradesperson_data
+
+    async def get_tradesperson_by_id(self, tradesperson_id: str) -> Optional[dict]:
+        tradesperson = await self.database.tradespeople.find_one({"id": tradesperson_id})
+        if tradesperson:
+            tradesperson['_id'] = str(tradesperson['_id'])
+        return tradesperson
+
+    async def get_tradesperson_by_email(self, email: str) -> Optional[dict]:
+        tradesperson = await self.database.tradespeople.find_one({"email": email})
+        if tradesperson:
+            tradesperson['_id'] = str(tradesperson['_id'])
+        return tradesperson
+
+    async def get_tradespeople(self, skip: int = 0, limit: int = 10, filters: dict = None) -> List[dict]:
+        query = filters or {}
+        cursor = self.database.tradespeople.find(query).sort("average_rating", -1).skip(skip).limit(limit)
+        tradespeople = await cursor.to_list(length=limit)
+        
+        for tradesperson in tradespeople:
+            tradesperson['_id'] = str(tradesperson['_id'])
+        return tradespeople
+
+    async def get_tradespeople_count(self, filters: dict = None) -> int:
+        query = filters or {}
+        return await self.database.tradespeople.count_documents(query)
+
+    async def update_tradesperson_stats(self, tradesperson_id: str):
+        # Calculate average rating
+        pipeline = [
+            {"$match": {"tradesperson_id": tradesperson_id}},
+            {"$group": {
+                "_id": None,
+                "avg_rating": {"$avg": "$rating"},
+                "total_reviews": {"$sum": 1}
+            }}
+        ]
+        
+        result = await self.database.reviews.aggregate(pipeline).to_list(1)
+        
+        if result:
+            avg_rating = round(result[0]['avg_rating'], 1)
+            total_reviews = result[0]['total_reviews']
+        else:
+            avg_rating = 0.0
+            total_reviews = 0
+
+        # Update tradesperson
+        await self.database.tradespeople.update_one(
+            {"id": tradesperson_id},
+            {
+                "$set": {
+                    "average_rating": avg_rating,
+                    "total_reviews": total_reviews,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+    # Quote operations
+    async def create_quote(self, quote_data: dict) -> dict:
+        result = await self.database.quotes.insert_one(quote_data)
+        quote_data['_id'] = str(result.inserted_id)
+        return quote_data
+
+    async def get_quote_by_id(self, quote_id: str) -> Optional[dict]:
+        quote = await self.database.quotes.find_one({"id": quote_id})
+        if quote:
+            quote['_id'] = str(quote['_id'])
+        return quote
+
+    async def get_quotes_by_job(self, job_id: str) -> List[dict]:
+        cursor = self.database.quotes.find({"job_id": job_id}).sort("created_at", -1)
+        quotes = await cursor.to_list(length=None)
+        
+        for quote in quotes:
+            quote['_id'] = str(quote['_id'])
+        return quotes
+
+    async def get_quotes_by_job_id(self, job_id: str) -> List[dict]:
+        """Alias for get_quotes_by_job for messaging system compatibility"""
+        return await self.get_quotes_by_job(job_id)
+
+    async def get_quotes_with_tradesperson_details(self, job_id: str) -> List[dict]:
+        """Get quotes with full tradesperson details"""
+        pipeline = [
+            {"$match": {"job_id": job_id}},
+            {"$lookup": {
+                "from": "users",
+                "localField": "tradesperson_id",
+                "foreignField": "id",
+                "as": "tradesperson"
+            }},
+            {"$unwind": "$tradesperson"},
+            {"$sort": {"created_at": -1}},
+            {"$project": {
+                "id": 1,
+                "job_id": 1,
+                "tradesperson_id": 1,  # Include tradesperson_id
+                "price": 1,
+                "message": 1,
+                "estimated_duration": 1,
+                "start_date": 1,
+                "status": 1,
+                "created_at": 1,
+                "tradesperson": {
+                    "id": "$tradesperson.id",
+                    "name": "$tradesperson.name",
+                    "company_name": "$tradesperson.company_name",
+                    "experience_years": "$tradesperson.experience_years",
+                    "average_rating": "$tradesperson.average_rating",
+                    "total_reviews": "$tradesperson.total_reviews",
+                    "trade_categories": "$tradesperson.trade_categories",
+                    "location": "$tradesperson.location",
+                    "verified_tradesperson": "$tradesperson.verified_tradesperson"
+                }
+            }}
+        ]
+        
+        quotes = await self.database.quotes.aggregate(pipeline).to_list(None)
+        return quotes
+
+    async def get_tradesperson_quotes_with_job_details(self, tradesperson_id: str, filters: dict = None, skip: int = 0, limit: int = 10) -> List[dict]:
+        """Get tradesperson's quotes with job details"""
+        match_query = {"tradesperson_id": tradesperson_id}
+        if filters:
+            match_query.update(filters)
+        
+        pipeline = [
+            {"$match": match_query},
+            {"$lookup": {
+                "from": "jobs",
+                "localField": "job_id",
+                "foreignField": "id",
+                "as": "job"
+            }},
+            {"$unwind": "$job"},
+            {"$sort": {"created_at": -1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            {"$project": {
+                "id": 1,
+                "price": 1,
+                "message": 1,
+                "estimated_duration": 1,
+                "start_date": 1,
+                "status": 1,
+                "created_at": 1,
+                "job": {
+                    "id": "$job.id",
+                    "title": "$job.title",
+                    "category": "$job.category",
+                    "location": "$job.location",
+                    "status": "$job.status",
+                    "homeowner": "$job.homeowner",
+                    "budget_min": "$job.budget_min",
+                    "budget_max": "$job.budget_max"
+                }
+            }}
+        ]
+        
+        quotes = await self.database.quotes.aggregate(pipeline).to_list(None)
+        return quotes
+
+    async def get_tradesperson_quotes_count(self, tradesperson_id: str, filters: dict = None) -> int:
+        match_query = {"tradesperson_id": tradesperson_id}
+        if filters:
+            match_query.update(filters)
+        return await self.database.quotes.count_documents(match_query)
+
+    async def update_quote_status(self, quote_id: str, status: str):
+        await self.database.quotes.update_one(
+            {"id": quote_id},
+            {"$set": {"status": status, "updated_at": datetime.utcnow()}}
+        )
+
+    async def reject_other_quotes(self, job_id: str, accepted_quote_id: str):
+        """Reject all other quotes when one is accepted"""
+        await self.database.quotes.update_many(
+            {"job_id": job_id, "id": {"$ne": accepted_quote_id}, "status": "pending"},
+            {"$set": {"status": "rejected", "updated_at": datetime.utcnow()}}
+        )
+
+    async def get_quote_statistics(self, job_id: str) -> dict:
+        """Get statistics for quotes on a job"""
+        pipeline = [
+            {"$match": {"job_id": job_id}},
+            {"$group": {
+                "_id": None,
+                "total_quotes": {"$sum": 1},
+                "pending_quotes": {"$sum": {"$cond": [{"$eq": ["$status", "pending"]}, 1, 0]}},
+                "accepted_quotes": {"$sum": {"$cond": [{"$eq": ["$status", "accepted"]}, 1, 0]}},
+                "rejected_quotes": {"$sum": {"$cond": [{"$eq": ["$status", "rejected"]}, 1, 0]}},
+                "average_price": {"$avg": "$price"},
+                "min_price": {"$min": "$price"},
+                "max_price": {"$max": "$price"}
+            }}
+        ]
+        
+        result = await self.database.quotes.aggregate(pipeline).to_list(1)
+        
+        if result:
+            return {
+                "total_quotes": result[0]["total_quotes"],
+                "pending_quotes": result[0]["pending_quotes"],
+                "accepted_quotes": result[0]["accepted_quotes"],
+                "rejected_quotes": result[0]["rejected_quotes"],
+                "average_price": result[0]["average_price"] or 0,
+                "min_price": result[0]["min_price"] or 0,
+                "max_price": result[0]["max_price"] or 0
+            }
+        else:
+            return {
+                "total_quotes": 0,
+                "pending_quotes": 0,
+                "accepted_quotes": 0,
+                "rejected_quotes": 0,
+                "average_price": 0,
+                "min_price": 0,
+                "max_price": 0
+            }
+
+    async def get_jobs_for_tradesperson(self, tradesperson_id: str, trade_categories: List[str], skip: int = 0, limit: int = 10) -> List[dict]:
+        """Get jobs available for a tradesperson to quote on"""
+        # Build query for jobs in tradesperson's categories
+        match_query = {
+            "status": "active",
+            "expires_at": {"$gt": datetime.utcnow()}
+        }
+        
+        if trade_categories:
+            match_query["category"] = {"$in": trade_categories}
+        
+        # Get jobs and exclude ones already quoted on
+        pipeline = [
+            {"$match": match_query},
+            {"$lookup": {
+                "from": "quotes",
+                "let": {"job_id": "$id"},
+                "pipeline": [
+                    {"$match": {
+                        "$expr": {
+                            "$and": [
+                                {"$eq": ["$job_id", "$$job_id"]},
+                                {"$eq": ["$tradesperson_id", tradesperson_id]}
+                            ]
+                        }
+                    }}
+                ],
+                "as": "existing_quotes"
+            }},
+            {"$match": {"existing_quotes": {"$size": 0}}},  # Exclude jobs already quoted on
+            {"$lookup": {
+                "from": "quotes",
+                "localField": "id",
+                "foreignField": "job_id",
+                "as": "all_quotes"
+            }},
+            {"$addFields": {
+                "quotes_count": {"$size": "$all_quotes"}
+            }},
+            {"$match": {"quotes_count": {"$lt": 5}}},  # Exclude jobs with 5+ quotes
+            {"$sort": {"created_at": -1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            {"$project": {
+                "id": 1,
+                "title": 1,
+                "description": 1,
+                "category": 1,
+                "location": 1,
+                "budget_min": 1,
+                "budget_max": 1,
+                "timeline": 1,
+                "created_at": 1,
+                "expires_at": 1,
+                "quotes_count": 1,
+                "homeowner": {
+                    "name": "$homeowner.name",
+                    "location": "$location"
+                }
+            }}
+        ]
+        
+        jobs = await self.database.jobs.aggregate(pipeline).to_list(None)
+        return jobs
+
+    async def get_available_jobs_count_for_tradesperson(self, tradesperson_id: str, trade_categories: List[str]) -> int:
+        """Count available jobs for a tradesperson"""
+        match_query = {
+            "status": "active",
+            "expires_at": {"$gt": datetime.utcnow()}
+        }
+        
+        if trade_categories:
+            match_query["category"] = {"$in": trade_categories}
+        
+        pipeline = [
+            {"$match": match_query},
+            {"$lookup": {
+                "from": "quotes",
+                "let": {"job_id": "$id"},
+                "pipeline": [
+                    {"$match": {
+                        "$expr": {
+                            "$and": [
+                                {"$eq": ["$job_id", "$$job_id"]},
+                                {"$eq": ["$tradesperson_id", tradesperson_id]}
+                            ]
+                        }
+                    }}
+                ],
+                "as": "existing_quotes"
+            }},
+            {"$match": {"existing_quotes": {"$size": 0}}},
+            {"$lookup": {
+                "from": "quotes",
+                "localField": "id",
+                "foreignField": "job_id",
+                "as": "all_quotes"
+            }},
+            {"$addFields": {
+                "quotes_count": {"$size": "$all_quotes"}
+            }},
+            {"$match": {"quotes_count": {"$lt": 5}}},
+            {"$count": "total"}
+        ]
+        
+        result = await self.database.jobs.aggregate(pipeline).to_list(1)
+        return result[0]["total"] if result else 0
+
+    async def update_job_status(self, job_id: str, status: str):
+        """Update job status"""
+        await self.database.jobs.update_one(
+            {"id": job_id},
+            {"$set": {"status": status, "updated_at": datetime.utcnow()}}
+        )
+
+    async def get_quotes_count_by_job(self, job_id: str) -> int:
+        return await self.database.quotes.count_documents({"job_id": job_id})
+
+    # Review operations
+    async def create_review(self, review_data: dict) -> dict:
+        result = await self.database.reviews.insert_one(review_data)
+        review_data['_id'] = str(result.inserted_id)
+        return review_data
+
+    async def get_reviews(self, skip: int = 0, limit: int = 10, filters: dict = None) -> List[dict]:
+        query = filters or {}
+        cursor = self.database.reviews.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        reviews = await cursor.to_list(length=limit)
+        
+        for review in reviews:
+            review['_id'] = str(review['_id'])
+        return reviews
+
+    async def get_reviews_count(self, filters: dict = None) -> int:
+        query = filters or {}
+        return await self.database.reviews.count_documents(query)
+
+    async def get_reviews_by_tradesperson(self, tradesperson_id: str, skip: int = 0, limit: int = 10) -> List[dict]:
+        cursor = self.database.reviews.find(
+            {"tradesperson_id": tradesperson_id}
+        ).sort("created_at", -1).skip(skip).limit(limit)
+        
+        reviews = await cursor.to_list(length=limit)
+        for review in reviews:
+            review['_id'] = str(review['_id'])
+        return reviews
+
+    # Statistics operations
+    async def get_platform_stats(self) -> dict:
+        # If database is not connected, return safe defaults
+        if not self.connected or self.database is None:
+            try:
+                from models.trade_categories import NIGERIAN_TRADE_CATEGORIES
+            except Exception:
+                NIGERIAN_TRADE_CATEGORIES = []
+            custom_data = await self.get_custom_trades()
+            custom_trades = custom_data.get("trades", []) if custom_data else []
+            total_categories = len(set(NIGERIAN_TRADE_CATEGORIES + custom_trades))
+            return {
+                "total_tradespeople": 0,
+                "total_categories": total_categories,
+                "total_reviews": 0,
+                "average_rating": 0.0,
+                "total_jobs": 0,
+                "active_jobs": 0
+            }
+
+        # Total tradespeople from users collection
+        total_tradespeople = await self.database.users.count_documents({"role": "tradesperson"})
+        
+        # Total reviews
+        total_reviews = await self.database.reviews.count_documents({})
+        
+        # Average rating
+        pipeline = [
+            {"$group": {
+                "_id": None,
+                "avg_rating": {"$avg": "$rating"}
+            }}
+        ]
+        
+        result = await self.database.reviews.aggregate(pipeline).to_list(1)
+        average_rating = round(result[0]['avg_rating'], 1) if result else 0.0
+        
+        # Total jobs
+        total_jobs = await self.database.jobs.count_documents({})
+        
+        # Active jobs
+        active_jobs = await self.database.jobs.count_documents({
+            "status": "active"
+        })
+        
+        # Get total available categories from static trade categories
+        try:
+            from models.trade_categories import NIGERIAN_TRADE_CATEGORIES
+            # Get custom trades from database
+            custom_data = await self.get_custom_trades()
+            custom_trades = custom_data.get("trades", []) if custom_data else []
+            
+            # Combine static and custom trades
+            all_trades = list(set(NIGERIAN_TRADE_CATEGORIES + custom_trades))
+            total_categories = len(all_trades)
+        except Exception as e:
+            logger.error(f"Error getting categories count: {e}")
+            # Fallback: count unique categories from tradespeople
+            users_with_categories = await self.database.users.find(
+                {"role": "tradesperson", "trade_categories": {"$exists": True, "$ne": None}},
+                {"trade_categories": 1}
+            ).to_list(length=None)
+            
+            all_categories = set()
+            for user in users_with_categories:
+                trade_categories = user.get("trade_categories", [])
+                if trade_categories:
+                    all_categories.update(trade_categories)
+            total_categories = len(all_categories)
+
+        return {
+            "total_tradespeople": total_tradespeople,
+            "total_categories": total_categories,
+            "total_reviews": total_reviews,
+            "average_rating": average_rating,
+            "total_jobs": total_jobs,
+            "active_jobs": active_jobs
+        }
+
+    # Category operations
+    async def get_categories_with_counts(self) -> List[dict]:
+        # If database is not connected, return static categories with zero counts
+        if not self.connected or self.database is None:
+            category_details = {
+                "Building & Construction": {
+                    "description": "From foundation to roofing, find experienced builders for your construction projects. Quality workmanship guaranteed.",
+                    "icon": "🏗️",
+                    "color": "from-orange-400 to-orange-600"
+                },
+                "Plumbing & Water Works": {
+                    "description": "Professional plumbers for installations, repairs, and water system maintenance. Available for emergency services.",
+                    "icon": "🔧",
+                    "color": "from-indigo-400 to-indigo-600"
+                },
+                "Electrical Installation": {
+                    "description": "Certified electricians for wiring, installations, and electrical repairs. Safe and reliable electrical services.",
+                    "icon": "⚡",
+                    "color": "from-yellow-400 to-yellow-600"
+                },
+                "Painting & Decorating": {
+                    "description": "Transform your space with professional painters and decorators. Interior and exterior painting services available.",
+                    "icon": "🎨",
+                    "color": "from-blue-400 to-blue-600"
+                },
+                "POP & Ceiling Works": {
+                    "description": "Expert ceiling installation and POP works. Modern designs and professional finishing for your interior spaces.",
+                    "icon": "🏠",
+                    "color": "from-purple-400 to-purple-600"
+                },
+                "Generator Installation & Repair": {
+                    "description": "Professional generator installation and maintenance services. Reliable power solutions for homes and businesses.",
+                    "icon": "🔌",
+                    "color": "from-red-400 to-red-600"
+                }
+            }
+            return [
+                {
+                    "title": name,
+                    "tradesperson_count": 0,
+                    **details
+                } for name, details in category_details.items()
+            ]
+
+        # Aggregate to count tradespeople by category from users collection
+        pipeline = [
+            {"$match": {"role": "tradesperson", "trade_categories": {"$exists": True, "$ne": None}}},
+            {"$unwind": "$trade_categories"},
+            {"$group": {
+                "_id": "$trade_categories",
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"count": -1}}
+        ]
+        
+        results = await self.database.users.aggregate(pipeline).to_list(None)
+        
+        # Define category details for Nigeria
+        category_details = {
+            "Building & Construction": {
+                "description": "From foundation to roofing, find experienced builders for your construction projects. Quality workmanship guaranteed.",
+                "icon": "🏗️",
+                "color": "from-orange-400 to-orange-600"
+            },
+            "Plumbing & Water Works": {
+                "description": "Professional plumbers for installations, repairs, and water system maintenance. Available for emergency services.",
+                "icon": "🔧",
+                "color": "from-indigo-400 to-indigo-600"
+            },
+            "Electrical Installation": {
+                "description": "Certified electricians for wiring, installations, and electrical repairs. Safe and reliable electrical services.",
+                "icon": "⚡",
+                "color": "from-yellow-400 to-yellow-600"
+            },
+            "Painting & Decorating": {
+                "description": "Transform your space with professional painters and decorators. Interior and exterior painting services available.",
+                "icon": "🎨",
+                "color": "from-blue-400 to-blue-600"
+            },
+            "POP & Ceiling Works": {
+                "description": "Expert ceiling installation and POP works. Modern designs and professional finishing for your interior spaces.",
+                "icon": "🏠",
+                "color": "from-purple-400 to-purple-600"
+            },
+            "Generator Installation & Repair": {
+                "description": "Professional generator installation and maintenance services. Reliable power solutions for homes and businesses.",
+                "icon": "🔌",
+                "color": "from-red-400 to-red-600"
+            }
+        }
+        
+        categories = []
+        for result in results:
+            category_name = result["_id"]
+            if category_name in category_details:
+                categories.append({
+                    "title": category_name,
+                    "tradesperson_count": result["count"],
+                    **category_details[category_name]
+                })
+        
+        return categories
+
+    async def get_featured_reviews(self, limit: int = 6) -> List[dict]:
+        """Get featured reviews for homepage"""
+        # Return empty list if database is not available
+        if not self.connected or self.database is None:
+            return []
+        # Get recent high-rated reviews that match the advanced review format
+        # Filter for reviews that have the advanced format fields
+        filters = {
+            'rating': {'$gte': 4},
+            'reviewer_id': {'$exists': True},
+            'reviewee_id': {'$exists': True},
+            'content': {'$exists': True},
+            'review_type': {'$exists': True}
+        }
+        
+        reviews = await self.get_reviews(limit=limit, filters=filters)
+        
+        # Enhance reviews with job location information
+        for review in reviews:
+            if '_id' in review:
+                review['_id'] = str(review['_id'])
+            
+            # Get job details for location
+            job_id = review.get("job_id")
+            if job_id:
+                job = await self.get_job_by_id(job_id)
+                if job:
+                    review["job_location"] = job.get("location", "")
+        
+        return reviews
+
+    # Portfolio Management Methods
+    async def create_portfolio_item(self, portfolio_data: dict) -> dict:
+        """Create a new portfolio item"""
+        await self.portfolio_collection.insert_one(portfolio_data)
+        return portfolio_data
+
+    async def get_portfolio_item_by_id(self, item_id: str) -> dict:
+        """Get portfolio item by ID"""
+        return await self.portfolio_collection.find_one({"id": item_id})
+
+    async def get_portfolio_items_by_tradesperson(self, tradesperson_id: str) -> List[dict]:
+        """Get all portfolio items for a specific tradesperson"""
+        cursor = self.portfolio_collection.find(
+            {"tradesperson_id": tradesperson_id}
+        ).sort("created_at", -1)
+        
+        items = await cursor.to_list(length=None)
+        
+        # Convert ObjectId to string
+        for item in items:
+            if '_id' in item:
+                item['_id'] = str(item['_id'])
+        
+        return items
+
+    async def get_public_portfolio_items_by_tradesperson(self, tradesperson_id: str) -> List[dict]:
+        """Get public portfolio items for a specific tradesperson"""
+        cursor = self.portfolio_collection.find({
+            "tradesperson_id": tradesperson_id,
+            "is_public": True
+        }).sort("created_at", -1)
+        
+        items = await cursor.to_list(length=None)
+        
+        # Convert ObjectId to string
+        for item in items:
+            if '_id' in item:
+                item['_id'] = str(item['_id'])
+        
+        return items
+
+    async def get_public_portfolio_items(self, category: str = None, limit: int = 20, offset: int = 0) -> List[dict]:
+        """Get all public portfolio items with optional filtering"""
+        filters = {"is_public": True}
+        if category:
+            filters["category"] = category
+        
+        cursor = self.portfolio_collection.find(filters).sort("created_at", -1).skip(offset).limit(limit)
+        
+        items = await cursor.to_list(length=None)
+        
+        # Convert ObjectId to string
+        for item in items:
+            if '_id' in item:
+                item['_id'] = str(item['_id'])
+        
+        return items
+
+    async def update_portfolio_item(self, item_id: str, update_data: dict) -> dict:
+        """Update portfolio item"""
+        await self.portfolio_collection.update_one(
+            {"id": item_id},
+            {"$set": update_data}
+        )
+        return await self.get_portfolio_item_by_id(item_id)
+
+    async def delete_portfolio_item(self, item_id: str) -> bool:
+        """Delete portfolio item"""
+        result = await self.portfolio_collection.delete_one({"id": item_id})
+        return result.deleted_count > 0
+
+    def get_current_time(self):
+        """Get current UTC time for timestamps"""
+        from datetime import datetime
+        return datetime.utcnow()
+
+    # Interest Management Methods (Lead Generation System)
+    async def create_interest(self, interest_data: dict) -> dict:
+        """Create a new interest record"""
+        # Check if tradesperson already showed interest in this job
+        existing_interest = await self.interests_collection.find_one({
+            "job_id": interest_data["job_id"],
+            "tradesperson_id": interest_data["tradesperson_id"]
+        })
+        
+        if existing_interest:
+            raise Exception("Already showed interest in this job")
+        
+        await self.interests_collection.insert_one(interest_data)
+        
+        # Update job's interests_count
+        await self.database.jobs.update_one(
+            {"id": interest_data["job_id"]},
+            {"$inc": {"interests_count": 1}}
+        )
+        
+        return interest_data
+
+    async def get_job_interested_tradespeople(self, job_id: str) -> List[dict]:
+        """Get all tradespeople who showed interest in a job"""
+        pipeline = [
+            {"$match": {"job_id": job_id}},
+            {
+                "$lookup": {
+                    "from": "users",
+                    "localField": "tradesperson_id",
+                    "foreignField": "id",
+                    "as": "tradesperson"
+                }
+            },
+            {"$unwind": "$tradesperson"},
+            {
+                "$project": {
+                    "interest_id": "$id",
+                    "tradesperson_id": "$tradesperson_id",
+                    "tradesperson_name": "$tradesperson.name",
+                    "tradesperson_email": "$tradesperson.email",
+                    "tradesperson_phone": "$tradesperson.phone",
+                    "company_name": "$tradesperson.company_name",
+                    "business_name": "$tradesperson.business_name",
+                    "trade_categories": "$tradesperson.trade_categories",
+                    "experience_years": "$tradesperson.experience_years",
+                    "average_rating": {"$ifNull": ["$tradesperson.average_rating", 4.5]},
+                    "total_reviews": {"$ifNull": ["$tradesperson.total_reviews", 0]},
+                    "location": "$tradesperson.location",
+                    "description": "$tradesperson.description",
+                    "certifications": "$tradesperson.certifications",
+                    "status": "$status",
+                    "created_at": "$created_at",
+                    "updated_at": "$updated_at",
+                    "contact_shared_at": "$contact_shared_at",
+                    "payment_made_at": "$payment_made_at",
+                    "access_fee": "$access_fee"
+                }
+            },
+            {"$sort": {"created_at": -1}}
+        ]
+        
+        interested = await self.interests_collection.aggregate(pipeline).to_list(length=None)
+        
+        # Convert ObjectId to string and add portfolio count
+        for person in interested:
+            if '_id' in person:
+                person['_id'] = str(person['_id'])
+            
+            # Get portfolio count for tradesperson
+            try:
+                portfolio_count = await self.database.portfolio.count_documents(
+                    {"tradesperson_id": person["tradesperson_id"]}
+                )
+                person["portfolio_count"] = portfolio_count
+            except Exception as e:
+                logging.warning(f"Could not get portfolio count for tradesperson {person['tradesperson_id']}: {e}")
+                person["portfolio_count"] = 0
+        
+        return interested
+
+    async def get_tradesperson_interests(self, tradesperson_id: str) -> List[dict]:
+        """Get all interests for a tradesperson"""
+        pipeline = [
+            {"$match": {"tradesperson_id": tradesperson_id}},
+            {
+                "$lookup": {
+                    "from": "jobs",
+                    "localField": "job_id",
+                    "foreignField": "id",
+                    "as": "job"
+                }
+            },
+            {"$unwind": "$job"},
+            {
+                "$project": {
+                    "id": 1,
+                    "job_id": 1,
+                    "status": 1,
+                    "created_at": 1,
+                    "contact_shared_at": 1,
+                    "payment_made_at": 1,
+                    "job_title": "$job.title",
+                    "job_location": "$job.location",
+                    "job_status": "$job.status",
+                    "homeowner_name": "$job.homeowner.name",
+                    "contact_shared": {"$eq": ["$status", "contact_shared"]},
+                    "payment_made": {"$eq": ["$status", "paid_access"]},
+                    "access_fee_coins": "$job.access_fee_coins",
+                    "access_fee_naira": "$job.access_fee_naira"
+                }
+            },
+            {"$sort": {"created_at": -1}}
+        ]
+        
+        interests = await self.interests_collection.aggregate(pipeline).to_list(length=None)
+        
+        # Convert ObjectId to string and set default access fees
+        for interest in interests:
+            if '_id' in interest:
+                interest['_id'] = str(interest['_id'])
+            
+            # Set default access fees if not present or null
+            if not interest.get("access_fee_naira") or interest.get("access_fee_naira") is None:
+                interest["access_fee_naira"] = 1000
+            if not interest.get("access_fee_coins") or interest.get("access_fee_coins") is None:
+                interest["access_fee_coins"] = 10
+        
+        return interests
+
+    async def get_contact_details(self, job_id: str, tradesperson_id: str) -> dict:
+        """Get homeowner contact details for paid access"""
+        # Verify tradesperson has paid access
+        interest = await self.interests_collection.find_one({
+            "job_id": job_id,
+            "tradesperson_id": tradesperson_id,
+            "status": "paid_access"
+        })
+        
+        if not interest:
+            raise Exception("Access not paid or interest not found")
+        
+        # Get job and homeowner details
+        job = await self.get_job_by_id(job_id)
+        if not job:
+            raise Exception("Job not found")
+        
+        homeowner = await self.get_user_by_email(job["homeowner"]["email"])
+        if not homeowner:
+            raise Exception("Homeowner not found")
+        
+        return {
+            "homeowner_name": homeowner["name"],
+            "homeowner_email": homeowner["email"],
+            "homeowner_phone": homeowner["phone"],
+            "job_title": job["title"],
+            "job_description": job["description"],
+            "job_location": job["location"],
+            "budget_range": f"₦{job.get('budget_min', 0):,} - ₦{job.get('budget_max', 0):,}" if job.get('budget_min') else None
+        }
+
+    async def get_interest_by_job_and_tradesperson(self, job_id: str, tradesperson_id: str) -> Optional[dict]:
+        """Get interest by job and tradesperson"""
+        interest = await self.interests_collection.find_one({
+            "job_id": job_id,
+            "tradesperson_id": tradesperson_id
+        })
+        
+        if interest:
+            interest["id"] = str(interest["_id"])
+            del interest["_id"]
+        
+        return interest
+
+    async def get_interest_by_id(self, interest_id: str) -> Optional[dict]:
+        """Get interest by ID"""
+        interest = await self.interests_collection.find_one({"id": interest_id})
+        
+        if interest:
+            # Ensure _id is properly converted to string
+            interest["_id"] = str(interest["_id"])
+        
+        return interest
+
+    async def update_interest_status(self, interest_id: str, update_data: dict) -> Optional[dict]:
+        """Update interest status and related fields"""
+        result = await self.interests_collection.update_one(
+            {"id": interest_id},
+            {"$set": update_data}
+        )
+        
+        if result.modified_count > 0:
+            return await self.get_interest_by_id(interest_id)
+        
+        return None
+
+    @property
+    def interests_collection(self):
+        """Access to interests collection"""
+        return self.database.interests
+
+    @property
+    def hiring_status_collection(self):
+        """Access to hiring_status collection"""
+        return self.database.hiring_status
+
+    # Review Management Methods (Trust & Quality System)
+    async def create_review(self, review: Review) -> Review:
+        """Create a new review"""
+        review_dict = review.dict()
+        review_dict["_id"] = review_dict["id"]
+        
+        await self.reviews_collection.insert_one(review_dict)
+        
+        # Update user's review summary
+        await self._update_user_review_summary(review.reviewee_id)
+        
+        return review
+
+    async def get_review_by_id(self, review_id: str) -> Optional[Review]:
+        """Get review by ID"""
+        review_doc = await self.reviews_collection.find_one({"id": review_id})
+        if review_doc:
+            review_doc["id"] = str(review_doc["_id"])
+            del review_doc["_id"]
+            return Review(**review_doc)
+        return None
+
+    async def get_user_reviews(
+        self, 
+        user_id: str, 
+        review_type: Optional[str] = None,
+        page: int = 1, 
+        limit: int = 10
+    ) -> Dict[str, Any]:
+        """Get reviews for a user with pagination"""
+        query = {"reviewee_id": user_id, "status": ReviewStatus.PUBLISHED}
+        
+        if review_type:
+            query["review_type"] = review_type
+        
+        # Get total count
+        total = await self.reviews_collection.count_documents(query)
+        
+        # Get paginated reviews
+        skip = (page - 1) * limit
+        cursor = self.reviews_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        
+        reviews = []
+        async for doc in cursor:
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            reviews.append(Review(**doc))
+        
+        # Calculate average rating
+        avg_rating = 0.0
+        if reviews:
+            avg_rating = sum(review.rating for review in reviews) / len(reviews)
+        
+        return {
+            "reviews": reviews,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total + limit - 1) // limit,
+            "average_rating": round(avg_rating, 1)
+        }
+
+    async def get_reviews_by_job(self, job_id: str) -> List[Review]:
+        """Get all reviews for a specific job"""
+        cursor = self.reviews_collection.find(
+            {"job_id": job_id, "status": ReviewStatus.PUBLISHED}
+        ).sort("created_at", -1)
+        
+        reviews = []
+        async for doc in cursor:
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            reviews.append(Review(**doc))
+        
+        return reviews
+
+    async def get_user_review_summary(self, user_id: str) -> ReviewSummary:
+        """Get comprehensive review summary for a user"""
+        # Get all published reviews for user
+        reviews_cursor = self.reviews_collection.find(
+            {"reviewee_id": user_id, "status": ReviewStatus.PUBLISHED}
+        ).sort("created_at", -1)
+        
+        all_reviews = []
+        total_rating = 0
+        rating_distribution = {"5": 0, "4": 0, "3": 0, "2": 0, "1": 0}
+        category_totals = {}
+        category_counts = {}
+        recommend_count = 0
+        
+        async for doc in reviews_cursor:
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            review = Review(**doc)
+            all_reviews.append(review)
+            
+            # Calculate rating statistics
+            total_rating += review.rating
+            rating_distribution[str(review.rating)] += 1
+            
+            # Calculate category averages
+            if review.category_ratings:
+                for category, rating in review.category_ratings.items():
+                    if category not in category_totals:
+                        category_totals[category] = 0
+                        category_counts[category] = 0
+                    category_totals[category] += rating
+                    category_counts[category] += 1
+            
+            # Count recommendations
+            if review.would_recommend:
+                recommend_count += 1
+        
+        # Calculate averages
+        total_reviews = len(all_reviews)
+        average_rating = (total_rating / total_reviews) if total_reviews > 0 else 0.0
+        
+        category_averages = {}
+        for category, total in category_totals.items():
+            category_averages[category] = round(total / category_counts[category], 1)
+        
+        recommendation_percentage = (recommend_count / total_reviews * 100) if total_reviews > 0 else 0.0
+        
+        return ReviewSummary(
+            total_reviews=total_reviews,
+            average_rating=round(average_rating, 1),
+            rating_distribution=rating_distribution,
+            category_averages=category_averages,
+            recent_reviews=all_reviews[:5],  # Last 5 reviews
+            recommendation_percentage=round(recommendation_percentage, 1),
+            verified_reviews_count=total_reviews  # All reviews are verified after job completion
+        )
+
+    async def update_review(self, review_id: str, update_data: Dict[str, Any]) -> Optional[Review]:
+        """Update a review"""
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.reviews_collection.update_one(
+            {"id": review_id},
+            {"$set": update_data}
+        )
+        
+        if result.modified_count > 0:
+            return await self.get_review_by_id(review_id)
+        return None
+
+    async def add_review_response(self, review_id: str, response: str, responder_id: str) -> Optional[Review]:
+        """Add response to a review"""
+        update_data = {
+            "response": response,
+            "response_date": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Verify the responder is the reviewee
+        review = await self.get_review_by_id(review_id)
+        if not review or review.reviewee_id != responder_id:
+            return None
+        
+        return await self.update_review(review_id, update_data)
+
+    async def mark_review_helpful(self, review_id: str, user_id: str) -> bool:
+        """Mark a review as helpful"""
+        # Check if user already marked this review
+        existing = await self.database.review_helpful.find_one({
+            "review_id": review_id,
+            "user_id": user_id
+        })
+        
+        if existing:
+            return False
+        
+        # Add helpful record
+        await self.database.review_helpful.insert_one({
+            "review_id": review_id,
+            "user_id": user_id,
+            "created_at": datetime.utcnow()
+        })
+        
+        # Increment helpful count
+        await self.reviews_collection.update_one(
+            {"id": review_id},
+            {"$inc": {"helpful_count": 1}}
+        )
+        
+        return True
+
+    async def get_platform_review_stats(self) -> ReviewStats:
+        """Get platform-wide review statistics"""
+        # Total reviews
+        total_reviews = await self.reviews_collection.count_documents(
+            {"status": ReviewStatus.PUBLISHED}
+        )
+        
+        # Rating distribution
+        pipeline = [
+            {"$match": {"status": ReviewStatus.PUBLISHED}},
+            {"$group": {
+                "_id": "$rating",
+                "count": {"$sum": 1}
+            }}
+        ]
+        
+        rating_counts = {}
+        total_rating = 0
+        async for doc in self.reviews_collection.aggregate(pipeline):
+            rating_counts[str(doc["_id"])] = doc["count"]
+            total_rating += doc["_id"] * doc["count"]
+        
+        average_rating = (total_rating / total_reviews) if total_reviews > 0 else 0.0
+        
+        # Reviews this month
+        from datetime import timedelta
+        month_ago = datetime.utcnow() - timedelta(days=30)
+        reviews_this_month = await self.reviews_collection.count_documents({
+            "status": ReviewStatus.PUBLISHED,
+            "created_at": {"$gte": month_ago}
+        })
+        
+        # Top rated tradespeople
+        top_tradespeople_pipeline = [
+            {"$match": {
+                "status": ReviewStatus.PUBLISHED,
+                "review_type": ReviewType.HOMEOWNER_TO_TRADESPERSON
+            }},
+            {"$group": {
+                "_id": "$reviewee_id",
+                "name": {"$first": "$reviewee_name"},
+                "average_rating": {"$avg": "$rating"},
+                "total_reviews": {"$sum": 1}
+            }},
+            {"$match": {"total_reviews": {"$gte": 5}}},
+            {"$sort": {"average_rating": -1, "total_reviews": -1}},
+            {"$limit": 10}
+        ]
+        
+        top_tradespeople = []
+        async for doc in self.reviews_collection.aggregate(top_tradespeople_pipeline):
+            top_tradespeople.append({
+                "id": doc["_id"],
+                "name": doc["name"],
+                "average_rating": round(doc["average_rating"], 1),
+                "total_reviews": doc["total_reviews"]
+            })
+        
+        # Recent reviews
+        recent_cursor = self.reviews_collection.find(
+            {"status": ReviewStatus.PUBLISHED}
+        ).sort("created_at", -1).limit(10)
+        
+        recent_reviews = []
+        async for doc in recent_cursor:
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            recent_reviews.append(Review(**doc))
+        
+        return ReviewStats(
+            total_reviews=total_reviews,
+            total_ratings=rating_counts,
+            average_platform_rating=round(average_rating, 1),
+            reviews_this_month=reviews_this_month,
+            top_rated_tradespeople=top_tradespeople,
+            top_rated_categories=[],  # TODO: Implement if needed
+            recent_reviews=recent_reviews
+        )
+
+    async def can_user_review(self, reviewer_id: str, reviewee_id: str, job_id: str) -> bool:
+        """Check if user can review another user for a specific job"""
+        # Check if review already exists
+        existing_review = await self.reviews_collection.find_one({
+            "reviewer_id": reviewer_id,
+            "reviewee_id": reviewee_id,
+            "job_id": job_id
+        })
+        
+        if existing_review:
+            return False
+        
+        # Check if job exists
+        job = await self.get_job_by_id(job_id)
+        if not job:
+            return False
+        
+        # Check if job is completed
+        if job.get("status") != "completed":
+            return False
+        
+        # Check if reviewer is the homeowner who posted the job
+        if reviewer_id == job.get("homeowner", {}).get("id"):
+            # Homeowner can review any tradesperson for their completed job
+            # Check if there's hiring status indicating they hired this tradesperson
+            hiring_status = await self.database.hiring_status.find_one({
+                "job_id": job_id,
+                "homeowner_id": reviewer_id,
+                "tradesperson_id": reviewee_id,
+                "hired": True
+            })
+            
+            if hiring_status:
+                return True
+            
+            # If no hiring status, fall back to checking interests (for backward compatibility)
+            interest = await self.interests_collection.find_one({
+                "job_id": job_id,
+                "tradesperson_id": reviewee_id,
+                "status": {"$in": ["contact_shared", "paid_access"]}
+            })
+            
+            return interest is not None
+        
+        # For tradesperson reviewing homeowner (less common case)
+        if reviewee_id == job.get("homeowner", {}).get("id"):
+            # Check if there's hiring status indicating homeowner hired this tradesperson
+            hiring_status = await self.database.hiring_status.find_one({
+                "job_id": job_id,
+                "homeowner_id": reviewee_id,
+                "tradesperson_id": reviewer_id,
+                "hired": True
+            })
+            
+            if hiring_status:
+                return True
+            
+            # Fall back to interests check
+            interest = await self.interests_collection.find_one({
+                "job_id": job_id,
+                "tradesperson_id": reviewer_id,
+                "status": {"$in": ["contact_shared", "paid_access"]}
+            })
+            
+            return interest is not None
+        
+        return False
+
+    async def _update_user_review_summary(self, user_id: str):
+        """Update cached review summary for user (internal method)"""
+        summary = await self.get_user_review_summary(user_id)
+        
+        # Update user profile with review stats
+        await self.database.users.update_one(
+            {"id": user_id},
+            {"$set": {
+                "total_reviews": summary.total_reviews,
+                "average_rating": summary.average_rating,
+                "recommendation_percentage": summary.recommendation_percentage,
+                "review_summary_updated_at": datetime.utcnow()
+            }}
+        )
+
+    async def get_reviews_requiring_moderation(self, limit: int = 50) -> List[Review]:
+        """Get reviews that need moderation"""
+        cursor = self.reviews_collection.find(
+            {"status": {"$in": [ReviewStatus.FLAGGED, ReviewStatus.PENDING]}}
+        ).sort("created_at", -1).limit(limit)
+        
+        reviews = []
+        async for doc in cursor:
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            reviews.append(Review(**doc))
+        
+        return reviews
+
+    @property
+    def reviews_collection(self):
+        """Access to reviews collection"""
+        return self.database.reviews
+
+    # Notification Management Methods
+    async def create_notification(self, notification: Notification) -> Notification:
+        """Create a new notification"""
+        notification_dict = notification.dict()
+        notification_dict["_id"] = notification_dict["id"]
+        
+        await self.notifications_collection.insert_one(notification_dict)
+        return notification
+
+    async def get_user_notification_preferences(self, user_id: str) -> NotificationPreferences:
+        """Get user notification preferences, create defaults if not exist"""
+        preferences = await self.notification_preferences_collection.find_one({"user_id": user_id})
+        
+        if not preferences:
+            # Create default preferences
+            default_preferences = NotificationPreferences(
+                id=str(uuid.uuid4()),
+                user_id=user_id
+            )
+            await self.create_notification_preferences(default_preferences)
+            return default_preferences
+        
+        # Convert MongoDB document to Pydantic model
+        preferences["id"] = str(preferences["_id"])
+        del preferences["_id"]
+        return NotificationPreferences(**preferences)
+
+    async def create_notification_preferences(self, preferences: NotificationPreferences) -> NotificationPreferences:
+        """Create notification preferences for a user"""
+        preferences_dict = preferences.dict()
+        preferences_dict["_id"] = preferences_dict["id"]
+        
+        await self.notification_preferences_collection.insert_one(preferences_dict)
+        return preferences
+
+    async def update_notification_preferences(self, user_id: str, updates: Dict[str, Any]) -> NotificationPreferences:
+        """Update user notification preferences"""
+        # Add updated timestamp
+        updates["updated_at"] = datetime.utcnow()
+        
+        await self.notification_preferences_collection.update_one(
+            {"user_id": user_id},
+            {"$set": updates}
+        )
+        
+        return await self.get_user_notification_preferences(user_id)
+
+    async def get_user_notifications(self, user_id: str, limit: int = 50, offset: int = 0) -> List[Notification]:
+        """Get notifications for a user with pagination"""
+        cursor = self.notifications_collection.find(
+            {"user_id": user_id}
+        ).sort("created_at", -1).skip(offset).limit(limit)
+        
+        notifications = []
+        async for doc in cursor:
+            doc["id"] = str(doc["_id"])
+            del doc["_id"]
+            notifications.append(Notification(**doc))
+        
+        return notifications
+
+    async def update_notification_status(self, notification_id: str, status: NotificationStatus, delivered_at: Optional[datetime] = None) -> bool:
+        """Update notification delivery status"""
+        update_data = {"status": status, "updated_at": datetime.utcnow()}
+        if delivered_at:
+            update_data["delivered_at"] = delivered_at
+        
+        result = await self.notifications_collection.update_one(
+            {"_id": notification_id},
+            {"$set": update_data}
+        )
+        
+        return result.modified_count > 0
+
+    async def mark_notification_as_read(self, notification_id: str, user_id: str) -> bool:
+        """Mark a specific notification as read for a user"""
+        result = await self.notifications_collection.update_one(
+            {"_id": notification_id, "user_id": user_id},
+            {"$set": {"status": "read", "read_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}
+        )
+        return result.modified_count > 0
+
+    async def mark_all_notifications_as_read(self, user_id: str) -> int:
+        """Mark all notifications as read for a user"""
+        result = await self.notifications_collection.update_many(
+            {"user_id": user_id, "status": {"$ne": "read"}},
+            {"$set": {"status": "read", "read_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}
+        )
+        return result.modified_count
+
+    async def delete_notification(self, notification_id: str, user_id: str) -> bool:
+        """Delete a specific notification for a user"""
+        result = await self.notifications_collection.delete_one(
+            {"_id": notification_id, "user_id": user_id}
+        )
+        return result.deleted_count > 0
+
+    async def get_notification_stats(self) -> Dict[str, Any]:
+        """Get notification delivery statistics"""
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$status",
+                    "count": {"$sum": 1}
+                }
+            }
+        ]
+        
+        status_counts = {}
+        async for doc in self.notifications_collection.aggregate(pipeline):
+            status_counts[doc["_id"]] = doc["count"]
+        
+        # Calculate delivery rate
+        total_sent = status_counts.get("sent", 0) + status_counts.get("delivered", 0)
+        total_attempts = sum(status_counts.values())
+        delivery_rate = (total_sent / total_attempts * 100) if total_attempts > 0 else 0
+        
+        # Get stats by type and channel
+        type_pipeline = [
+            {
+                "$group": {
+                    "_id": "$type",
+                    "count": {"$sum": 1}
+                }
+            }
+        ]
+        
+        channel_pipeline = [
+            {
+                "$group": {
+                    "_id": "$channel",
+                    "count": {"$sum": 1}
+                }
+            }
+        ]
+        
+        by_type = {}
+        async for doc in self.notifications_collection.aggregate(type_pipeline):
+            by_type[doc["_id"]] = doc["count"]
+        
+        by_channel = {}
+        async for doc in self.notifications_collection.aggregate(channel_pipeline):
+            by_channel[doc["_id"]] = doc["count"]
+        
+        # Get recent failures
+        recent_failures = []
+        cursor = self.notifications_collection.find(
+            {"status": "failed"}
+        ).sort("created_at", -1).limit(10)
+        
+        async for doc in cursor:
+            recent_failures.append({
+                "id": str(doc["_id"]),
+                "type": doc["type"],
+                "channel": doc["channel"],
+                "created_at": doc["created_at"],
+                "metadata": doc.get("metadata", {})
+            })
+        
+        return {
+            "total_sent": total_sent,
+            "delivery_rate": round(delivery_rate, 2),
+            "by_type": by_type,
+            "by_channel": by_channel,
+            "recent_failures": recent_failures
+        }
+
+    @property
+    def notifications_collection(self):
+        """Access to notifications collection"""
+        return self.database.notifications
+
+    @property
+    def notification_preferences_collection(self):
+        """Access to notification preferences collection"""
+        return self.database.notification_preferences
+
+    # ==========================================
+    # WALLET SYSTEM METHODS
+    # ==========================================
+    
+    @property
+    def wallets_collection(self):
+        """Access to wallets collection"""
+        return self.database.wallets
+    
+    @property
+    def wallet_transactions_collection(self):
+        """Access to wallet transactions collection"""
+        return self.database.wallet_transactions
+
+    async def create_wallet(self, user_id: str) -> dict:
+        """Create a new wallet for user"""
+        wallet_data = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "balance_coins": 0,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Check if wallet already exists
+        existing = await self.wallets_collection.find_one({"user_id": user_id})
+        if existing:
+            return existing
+            
+        await self.wallets_collection.insert_one(wallet_data)
+        return wallet_data
+
+    async def get_wallet_by_user_id(self, user_id: str) -> Optional[dict]:
+        """Get wallet by user ID"""
+        wallet = await self.wallets_collection.find_one({"user_id": user_id})
+        if not wallet:
+            # Create wallet if it doesn't exist
+            wallet = await self.create_wallet(user_id)
+        return wallet
+
+    async def update_wallet_balance(self, user_id: str, coins_change: int) -> bool:
+        """Update wallet balance (positive to add, negative to deduct)"""
+        result = await self.wallets_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$inc": {"balance_coins": coins_change},
+                "$set": {"updated_at": datetime.utcnow()}
+            }
+        )
+        return result.modified_count > 0
+
+    async def create_wallet_transaction(self, transaction_data: dict) -> dict:
+        """Create a new wallet transaction"""
+        transaction_data["id"] = str(uuid.uuid4())
+        transaction_data["created_at"] = datetime.utcnow()
+        
+        await self.wallet_transactions_collection.insert_one(transaction_data)
+        return transaction_data
+
+    async def get_wallet_transactions(self, user_id: str, skip: int = 0, limit: int = 10) -> List[dict]:
+        """Get wallet transactions for user"""
+        cursor = self.wallet_transactions_collection.find(
+            {"user_id": user_id}
+        ).sort("created_at", -1).skip(skip).limit(limit)
+        
+        transactions = []
+        async for transaction in cursor:
+            transaction["_id"] = str(transaction["_id"])
+            transactions.append(transaction)
+        
+        return transactions
+
+    async def get_pending_funding_requests(self, skip: int = 0, limit: int = 20) -> List[dict]:
+        """Get pending wallet funding requests for admin"""
+        cursor = self.wallet_transactions_collection.find({
+            "transaction_type": "wallet_funding",
+            "status": "pending"
+        }).sort("created_at", -1).skip(skip).limit(limit)
+        
+        requests = []
+        async for request in cursor:
+            request["_id"] = str(request["_id"])
+            # Get user details
+            user = await self.get_user_by_id(request["user_id"])
+            if user:
+                request["user_name"] = user.get("name", "Unknown")
+                request["user_email"] = user.get("email", "Unknown")
+            requests.append(request)
+        
+        return requests
+
+    async def confirm_wallet_funding(self, transaction_id: str, admin_id: str, admin_notes: str = "") -> bool:
+        """Confirm wallet funding request"""
+        # Get transaction
+        transaction = await self.wallet_transactions_collection.find_one({"id": transaction_id})
+        if not transaction or transaction["status"] != "pending":
+            return False
+        
+        # Update transaction status
+        result = await self.wallet_transactions_collection.update_one(
+            {"id": transaction_id},
+            {
+                "$set": {
+                    "status": "confirmed",
+                    "processed_by": admin_id,
+                    "admin_notes": admin_notes,
+                    "processed_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        if result.modified_count > 0:
+            # Add coins to wallet
+            coins_to_add = transaction["amount_coins"]
+            await self.update_wallet_balance(transaction["user_id"], coins_to_add)
+            return True
+        
+        return False
+
+    async def reject_wallet_funding(self, transaction_id: str, admin_id: str, admin_notes: str = "") -> bool:
+        """Reject wallet funding request"""
+        result = await self.wallet_transactions_collection.update_one(
+            {"id": transaction_id, "status": "pending"},
+            {
+                "$set": {
+                    "status": "rejected",
+                    "processed_by": admin_id,
+                    "admin_notes": admin_notes,
+                    "processed_at": datetime.utcnow()
+                }
+            }
+        )
+        return result.modified_count > 0
+
+    async def deduct_access_fee(self, user_id: str, job_id: str, access_fee_coins: int) -> bool:
+        """Deduct access fee from wallet and create transaction record"""
+        # Check wallet balance
+        wallet = await self.get_wallet_by_user_id(user_id)
+        if wallet["balance_coins"] < access_fee_coins:
+            return False
+        
+        # Deduct coins
+        success = await self.update_wallet_balance(user_id, -access_fee_coins)
+        if not success:
+            return False
+        
+        # Create transaction record
+        transaction_data = {
+            "wallet_id": wallet["id"],
+            "user_id": user_id,
+            "transaction_type": "access_fee_deduction",
+            "amount_coins": access_fee_coins,
+            "amount_naira": access_fee_coins * 100,  # Convert to naira
+            "status": "confirmed",
+            "description": f"Access fee for job contact details",
+            "reference": job_id,
+            "processed_at": datetime.utcnow()
+        }
+        
+        await self.create_wallet_transaction(transaction_data)
+        return True
+
+    # ==========================================
+    # JOB ACCESS FEE METHODS  
+    # ==========================================
+    
+    async def update_job_access_fee(self, job_id: str, access_fee_naira: int) -> bool:
+        """Update job access fee (admin only)"""
+        access_fee_coins = access_fee_naira // 100  # Convert to coins
+        
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {
+                "$set": {
+                    "access_fee_naira": access_fee_naira,
+                    "access_fee_coins": access_fee_coins,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        return result.modified_count > 0
+
+    async def get_jobs_with_access_fees(self, skip: int = 0, limit: int = 20) -> List[dict]:
+        """Get all jobs with access fees for admin management"""
+        cursor = self.database.jobs.find({}).sort("created_at", -1).skip(skip).limit(limit)
+        
+        jobs = []
+        async for job in cursor:
+            job["_id"] = str(job["_id"])
+            
+            # Get homeowner details using multiple approaches
+            homeowner_id = None
+            homeowner_info = None
+            
+            # First, check if homeowner_id exists at root level
+            if "homeowner_id" in job and job["homeowner_id"]:
+                homeowner_id = job["homeowner_id"]
+                homeowner = await self.database.users.find_one({"id": homeowner_id})
+                if homeowner:
+                    homeowner_info = {
+                        "id": homeowner["id"],
+                        "name": homeowner.get("name", "Unknown"),
+                        "email": homeowner.get("email", ""),
+                        "phone": homeowner.get("phone", "")
+                    }
+                    homeowner_info["verification_status"] = homeowner.get("verification_status", "pending")
+                    homeowner_info["join_date"] = homeowner.get("created_at")
+                    # Count total jobs for this homeowner
+                    homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                        "$or": [
+                            {"homeowner_id": homeowner_id},
+                            {"homeowner.id": homeowner_id}
+                        ]
+                    })
+            
+            # If no homeowner_id at root, check if homeowner object exists
+            elif "homeowner" in job and isinstance(job["homeowner"], dict):
+                homeowner_obj = job["homeowner"]
+                homeowner_id = homeowner_obj.get("id")
+                
+                if homeowner_id and homeowner_id != "unknown":
+                    # Try to get updated user info from users collection
+                    homeowner = await self.database.users.find_one({"id": homeowner_id})
+                    if homeowner:
+                        homeowner_info = {
+                            "id": homeowner["id"],
+                            "name": homeowner.get("name", homeowner_obj.get("name", "Unknown")),
+                            "email": homeowner.get("email", homeowner_obj.get("email", "")),
+                            "phone": homeowner.get("phone", homeowner_obj.get("phone", ""))
+                        }
+                        homeowner_info["verification_status"] = homeowner.get("verification_status", "pending")
+                        homeowner_info["join_date"] = homeowner.get("created_at")
+                        # Count total jobs for this homeowner
+                        homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                            "$or": [
+                                {"homeowner_id": homeowner_id},
+                                {"homeowner.id": homeowner_id}
+                            ]
+                        })
+                    else:
+                        # Use the embedded homeowner data
+                        homeowner_info = {
+                            "id": homeowner_obj.get("id", "unknown"),
+                            "name": homeowner_obj.get("name", "Unknown"),
+                            "email": homeowner_obj.get("email", ""),
+                            "phone": homeowner_obj.get("phone", "")
+                        }
+                        homeowner_info["verification_status"] = "pending"
+                        homeowner_info["join_date"] = job.get("created_at")
+                        # Count total jobs for this homeowner
+                        homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                            "$or": [
+                                {"homeowner_id": homeowner_id},
+                                {"homeowner.id": homeowner_id}
+                            ]
+                        })
+                else:
+                    # NEW: Handle case where homeowner object exists but has no ID
+                    # Use the embedded homeowner data directly (name and email available)
+                    homeowner_name = homeowner_obj.get("name", "Unknown")
+                    homeowner_email = homeowner_obj.get("email", "")
+                    
+                    if homeowner_name != "Unknown" or homeowner_email:
+                        # Try to find user by email if available
+                        if homeowner_email:
+                            homeowner = await self.database.users.find_one({"email": homeowner_email})
+                            if homeowner:
+                                homeowner_info = {
+                                    "id": homeowner["id"],
+                                    "name": homeowner.get("name", homeowner_name),
+                                    "email": homeowner.get("email", homeowner_email),
+                                    "phone": homeowner.get("phone", homeowner_obj.get("phone", ""))
+                                }
+                                homeowner_info["verification_status"] = homeowner.get("verification_status", "pending")
+                                homeowner_info["join_date"] = homeowner.get("created_at")
+                                # Count total jobs for this homeowner using email
+                                homeowner_info["total_jobs"] = await self.database.jobs.count_documents({
+                                    "homeowner.email": homeowner_email
+                                })
+                            else:
+                                # Use embedded data even without user ID
+                                homeowner_info = {
+                                    "id": "legacy",
+                                    "name": homeowner_name,
+                                    "email": homeowner_email,
+                                    "phone": homeowner_obj.get("phone", ""),
+                                    "verification_status": "legacy",
+                                    "join_date": job.get("created_at"),
+                                    "total_jobs": await self.database.jobs.count_documents({
+                                        "homeowner.email": homeowner_email
+                                    }) if homeowner_email else 1
+                                }
+                        else:
+                            # Only name available, no email for lookup
+                            homeowner_info = {
+                                "id": "legacy",
+                                "name": homeowner_name,
+                                "email": "",
+                                "phone": homeowner_obj.get("phone", ""),
+                                "verification_status": "legacy",
+                                "join_date": job.get("created_at"),
+                                "total_jobs": await self.database.jobs.count_documents({
+                                    "homeowner.name": homeowner_name
+                                }) if homeowner_name != "Unknown" else 1
+                            }
+                    else:
+                        # Fallback for completely empty homeowner object
+                        homeowner_info = {
+                            "id": "unknown",
+                            "name": "Unknown",
+                            "email": "",
+                            "phone": "",
+                            "verification_status": "pending",
+                            "join_date": job.get("created_at"),
+                            "total_jobs": 1
+                        }
+            
+            # If still no homeowner info found, use legacy fields or defaults
+            if not homeowner_info:
+                homeowner_info = {
+                    "id": "unknown",
+                    "name": job.get("homeowner_name", "Unknown"),
+                    "email": job.get("homeowner_email", ""),
+                    "phone": job.get("homeowner_phone", ""),
+                    "verification_status": "pending",
+                    "join_date": job.get("created_at"),
+                    "total_jobs": 0
+                }
+            
+            # Set the homeowner info in the job
+            job["homeowner"] = homeowner_info
+            
+            # Set default access fee if not present
+            if "access_fee_naira" not in job:
+                job["access_fee_naira"] = 1000  # Default ₦1000
+                job["access_fee_coins"] = 10    # Default 10 coins
+            
+            jobs.append(job)
+        
+        return jobs
+
+    # ==========================================
+    # LOCATION-BASED METHODS
+    # ==========================================
+    
+    def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between two points using Haversine formula (in kilometers)"""
+        import math
+        
+        # Convert latitude and longitude from degrees to radians
+        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        
+        # Radius of Earth in kilometers
+        r = 6371
+        
+        return c * r
+
+    async def get_jobs_near_location(self, latitude: float, longitude: float, max_distance_km: int = 25, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get jobs within specified distance from a location"""
+        # Get all active jobs with location data
+        cursor = self.database.jobs.find({
+            "status": "active",
+            "latitude": {"$exists": True, "$ne": None},
+            "longitude": {"$exists": True, "$ne": None}
+        }).skip(skip).limit(limit * 2)  # Get more to filter by distance
+        
+        jobs_with_distance = []
+        
+        async for job in cursor:
+            job["_id"] = str(job["_id"])
+            
+            # Calculate distance
+            distance = self.calculate_distance(
+                latitude, longitude,
+                job["latitude"], job["longitude"]
+            )
+            
+            # Only include jobs within max distance
+            if distance <= max_distance_km:
+                job["distance_km"] = round(distance, 1)
+                jobs_with_distance.append(job)
+        
+        # Sort by distance (closest first)
+        jobs_with_distance.sort(key=lambda x: x["distance_km"])
+        
+        # Limit to requested number
+        return jobs_with_distance[:limit]
+
+    async def update_user_location(self, user_id: str, latitude: float, longitude: float, travel_distance_km: int = None) -> bool:
+        """Update user's location and travel distance"""
+        update_data = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "updated_at": datetime.utcnow()
+        }
+        
+        if travel_distance_km is not None:
+            update_data["travel_distance_km"] = travel_distance_km
+        
+        result = await self.users_collection.update_one(
+            {"id": user_id},
+            {"$set": update_data}
+        )
+        
+        return result.modified_count > 0
+
+    async def update_job_location(self, job_id: str, latitude: float, longitude: float) -> bool:
+        """Update job location coordinates"""
+        result = await self.database.jobs.update_one(
+            {"id": job_id},
+            {
+                "$set": {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        return result.modified_count > 0
+
+    async def get_available_jobs(self, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get all available (active) jobs"""
+        return await self.get_jobs(skip=skip, limit=limit, filters={"status": "active"})
+
+    async def get_jobs_for_tradesperson(self, tradesperson_id: str, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get jobs filtered by tradesperson's skills and location preferences"""
+        try:
+            # Get tradesperson details
+            tradesperson = await self.get_user_by_id(tradesperson_id)
+            if not tradesperson:
+                # Fallback to all jobs if tradesperson not found
+                return await self.get_available_jobs(skip=skip, limit=limit)
+            
+            # Build the job filter based on tradesperson profile
+            job_filter = {"status": "active"}
+            
+            # 1. SKILLS FILTERING - Only show jobs matching tradesperson's trade categories
+            tradesperson_categories = tradesperson.get("trade_categories", [])
+            if tradesperson_categories:
+                # Case-insensitive matching for trade categories
+                category_regex_patterns = [{"category": {"$regex": f"^{category}$", "$options": "i"}} for category in tradesperson_categories]
+                job_filter["$or"] = category_regex_patterns
+                print(f"Skills filter applied: {tradesperson_categories}")
+            
+            # 2. LOCATION FILTERING - Show jobs within tradesperson's travel distance
+            if (tradesperson.get("latitude") is not None and 
+                tradesperson.get("longitude") is not None):
+                
+                max_distance = tradesperson.get("travel_distance_km", 25)  # Default 25km
+                print(f"Location filter applied: {max_distance}km radius")
+                
+                # Use location-based filtering with skills filtering
+                return await self.get_jobs_near_location_with_skills(
+                    latitude=tradesperson["latitude"],
+                    longitude=tradesperson["longitude"],
+                    max_distance_km=max_distance,
+                    skill_categories=tradesperson_categories,
+                    skip=skip,
+                    limit=limit
+                )
+            else:
+                # No location data, use skills-only filtering
+                print("Using skills-only filtering (no location data)")
+                cursor = self.database.jobs.find(job_filter).sort("created_at", -1).skip(skip).limit(limit)
+                jobs = await cursor.to_list(length=None)
+                
+                # Process and enrich jobs data
+                processed_jobs = []
+                for job in jobs:
+                    processed_job = await self._process_job_data(job)
+                    processed_jobs.append(processed_job)
+                
+                return processed_jobs
+                
+        except Exception as e:
+            print(f"Error in get_jobs_for_tradesperson: {str(e)}")
+            # Fallback to general available jobs
+            return await self.get_available_jobs(skip=skip, limit=limit)
+
+    async def get_jobs_near_location_with_skills(self, latitude: float, longitude: float, 
+                                               max_distance_km: float, skill_categories: List[str],
+                                               skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get jobs near location that match tradesperson's skills"""
+        try:
+            # Build skills filter
+            skills_filter = {}
+            if skill_categories:
+                category_regex_patterns = [{"category": {"$regex": f"^{category}$", "$options": "i"}} for category in skill_categories]
+                skills_filter["$or"] = category_regex_patterns
+            
+            # Base filter for active jobs with location data
+            base_filter = {
+                "status": "active",
+                "latitude": {"$exists": True, "$ne": None},
+                "longitude": {"$exists": True, "$ne": None}
+            }
+            
+            # Combine skills and base filters
+            combined_filter = {"$and": [base_filter, skills_filter]} if skills_filter else base_filter
+            
+            # Get jobs matching skills filter first
+            cursor = self.database.jobs.find(combined_filter).skip(skip).limit(limit * 2)  # Get extra to account for distance filtering
+            jobs = await cursor.to_list(length=None)
+            
+            # Calculate distances and filter by location
+            jobs_within_distance = []
+            for job in jobs:
+                job_lat = job.get("latitude")
+                job_lng = job.get("longitude")
+                
+                if job_lat is not None and job_lng is not None:
+                    distance = self.calculate_distance(latitude, longitude, job_lat, job_lng)
+                    if distance <= max_distance_km:
+                        job["_id"] = str(job["_id"])
+                        job["distance_km"] = round(distance, 2)
+                        jobs_within_distance.append(job)
+            
+            # Sort by distance (closest first) and limit results
+            jobs_within_distance.sort(key=lambda x: x.get("distance_km", float('inf')))
+            limited_jobs = jobs_within_distance[:limit]
+            
+            return limited_jobs
+            
+        except Exception as e:
+            print(f"Error getting jobs near location with skills: {str(e)}")
+            return []
+
+    async def _process_job_data(self, job: dict) -> dict:
+        """Process and enrich job data with additional information"""
+        try:
+            # Convert ObjectId to string
+            if "_id" in job:
+                job["_id"] = str(job["_id"])
+            
+            # Add any additional processing here if needed
+            # For example: enrich with homeowner info, interests count, etc.
+            
+            return job
+        except Exception as e:
+            print(f"Error processing job data: {str(e)}")
+            return job
+
+    # ==========================================
+    # REFERRAL SYSTEM METHODS
+    # ==========================================
+    
+    @property
+    def referrals_collection(self):
+        """Access to referrals collection"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: referrals collection not accessible")
+        return self.database.referrals
+    
+    @property
+    def user_verifications_collection(self):
+        """Access to user verifications collection"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: user verifications collection not accessible")
+        return self.database.user_verifications
+    
+    @property
+    def referral_codes_collection(self):
+        """Access to referral codes collection"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: referral codes collection not accessible")
+        return self.database.referral_codes
+
+    async def generate_referral_code(self, user_id: str) -> str:
+        """Generate unique referral code for user"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot generate referral code")
+        # Get user info for code generation
+        user = await self.get_user_by_id(user_id)
+        if not user:
+            raise ValueError("User not found")
+        
+        # Generate code based on name + random numbers
+        base_name = user["name"].split()[0].upper()[:4]  # First 4 letters of first name
+        
+        # Find unique code
+        import random
+        for _ in range(10):  # Try 10 times
+            random_num = random.randint(1000, 9999)
+            code = f"{base_name}{random_num}"
+            
+            # Check if code exists
+            existing = await self.referral_codes_collection.find_one({"code": code})
+            if not existing:
+                # Create referral code record
+                referral_code_data = {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "code": code,
+                    "is_active": True,
+                    "created_at": datetime.utcnow(),
+                    "uses_count": 0
+                }
+                
+                await self.referral_codes_collection.insert_one(referral_code_data)
+                
+                # Update user record
+                await self.users_collection.update_one(
+                    {"id": user_id},
+                    {"$set": {"referral_code": code}}
+                )
+                
+                return code
+        
+        # Fallback to UUID if no unique code found
+        fallback_code = str(uuid.uuid4())[:8].upper()
+        referral_code_data = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "code": fallback_code,
+            "is_active": True,
+            "created_at": datetime.utcnow(),
+            "uses_count": 0
+        }
+        
+        await self.referral_codes_collection.insert_one(referral_code_data)
+        await self.users_collection.update_one(
+            {"id": user_id},
+            {"$set": {"referral_code": fallback_code}}
+        )
+        
+        return fallback_code
+
+    async def record_referral(self, referrer_code: str, referred_user_id: str) -> bool:
+        """Record a referral when someone signs up with a referral code"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot record referral")
+        # Find referrer by code
+        referral_code_record = await self.referral_codes_collection.find_one({"code": referrer_code, "is_active": True})
+        if not referral_code_record:
+            return False
+        
+        referrer_id = referral_code_record["user_id"]
+        
+        # Don't allow self-referral
+        if referrer_id == referred_user_id:
+            return False
+        
+        # Check if referral already exists
+        existing = await self.referrals_collection.find_one({
+            "referrer_id": referrer_id,
+            "referred_user_id": referred_user_id
+        })
+        if existing:
+            return False
+        
+        # Create referral record
+        referral_data = {
+            "id": str(uuid.uuid4()),
+            "referrer_id": referrer_id,
+            "referred_user_id": referred_user_id,
+            "referral_code": referrer_code,
+            "status": "pending",
+            "coins_earned": 0,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        await self.referrals_collection.insert_one(referral_data)
+        
+        # Update referral code usage count
+        await self.referral_codes_collection.update_one(
+            {"code": referrer_code},
+            {"$inc": {"uses_count": 1}}
+        )
+        
+        # Update referred user to track who referred them
+        await self.users_collection.update_one(
+            {"id": referred_user_id},
+            {"$set": {"referred_by": referrer_id}}
+        )
+        
+        return True
+
+    async def submit_verification_documents(self, user_id: str, document_type: str, document_url: str, full_name: str, document_number: str = None) -> str:
+        """Submit verification documents"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot submit verification documents")
+        verification_data = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "document_type": document_type,
+            "document_url": document_url,
+            "full_name": full_name,
+            "document_number": document_number,
+            "status": "pending",
+            "submitted_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        await self.user_verifications_collection.insert_one(verification_data)
+        
+        # Update user status
+        await self.users_collection.update_one(
+            {"id": user_id},
+            {"$set": {"verification_submitted": True}}
+        )
+        
+        return verification_data["id"]
+
+    async def verify_user_documents(self, verification_id: str, admin_id: str, approved: bool, admin_notes: str = "") -> bool:
+        """Admin approves or rejects user verification"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot verify documents")
+        verification = await self.user_verifications_collection.find_one({"id": verification_id})
+        if not verification:
+            return False
+        
+        status = "verified" if approved else "rejected"
+        
+        # Update verification record
+        result = await self.user_verifications_collection.update_one(
+            {"id": verification_id},
+            {
+                "$set": {
+                    "status": status,
+                    "admin_notes": admin_notes,
+                    "verified_by": admin_id,
+                    "verified_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        if result.modified_count == 0:
+            return False
+        
+        if approved:
+            # Update user verification status
+            await self.users_collection.update_one(
+                {"id": verification["user_id"]},
+                {"$set": {"is_verified": True}}
+            )
+            
+            # Process referral rewards
+            await self._process_referral_rewards(verification["user_id"])
+        
+        return True
+
+    async def _process_referral_rewards(self, verified_user_id: str):
+        """Process referral rewards when user gets verified"""
+        if self.database is None:
+            raise RuntimeError("Database unavailable: cannot process referral rewards")
+        # Find pending referral for this user
+        referral = await self.referrals_collection.find_one({
+            "referred_user_id": verified_user_id,
+            "status": "pending"
+        })
+        
+        if not referral:
+            return
+        
+        # Award 5 coins to referrer
+        coins_to_award = 5
+        referrer_id = referral["referrer_id"]
+        
+        # Get or create referrer's wallet
+        wallet = await self.get_wallet_by_user_id(referrer_id)
+        
+        # Add referral coins to wallet
+        await self.wallets_collection.update_one(
+            {"user_id": referrer_id},
+            {
+                "$inc": {"balance_coins": coins_to_award},
+                "$set": {"updated_at": datetime.utcnow()}
+            }
+        )
+        
+        # Create transaction record
+        transaction_data = {
+            "wallet_id": wallet["id"],
+            "user_id": referrer_id,
+            "transaction_type": "referral_reward",
+            "amount_coins": coins_to_award,
+            "amount_naira": coins_to_award * 100,
+            "status": "confirmed",
+            "description": f"Referral reward for successful referral",
+            "reference": verified_user_id,
+            "processed_at": datetime.utcnow()
+        }
+        
+        await self.create_wallet_transaction(transaction_data)
+        
+        # Update referral record
+        await self.referrals_collection.update_one(
+            {"id": referral["id"]},
+            {
+                "$set": {
+                    "status": "verified",
+                    "coins_earned": coins_to_award,
+                    "verified_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Update referrer's stats
+        await self.users_collection.update_one(
+            {"id": referrer_id},
+            {
+                "$inc": {
+                    "total_referrals": 1,
+                    "referral_coins_earned": coins_to_award
+                }
+            }
+        )
+
+    async def get_user_referral_stats(self, user_id: str) -> dict:
+        """Get referral statistics for user"""
+        # Get user's referral code
+        user = await self.get_user_by_id(user_id)
+        if not user:
+            return None
+        
+        referral_code = user.get("referral_code")
+        if not referral_code:
+            # Generate referral code if doesn't exist
+            referral_code = await self.generate_referral_code(user_id)
+        
+        # Get referral statistics
+        total_referrals = await self.referrals_collection.count_documents({"referrer_id": user_id})
+        pending_referrals = await self.referrals_collection.count_documents({
+            "referrer_id": user_id,
+            "status": "pending"
+        })
+        verified_referrals = await self.referrals_collection.count_documents({
+            "referrer_id": user_id,
+            "status": "verified"
+        })
+        
+        # Get total coins earned from referrals
+        pipeline = [
+            {"$match": {"referrer_id": user_id, "status": "verified"}},
+            {"$group": {"_id": None, "total_coins": {"$sum": "$coins_earned"}}}
+        ]
+        
+        total_coins_earned = 0
+        async for doc in self.referrals_collection.aggregate(pipeline):
+            total_coins_earned = doc["total_coins"]
+        
+        return {
+            "total_referrals": total_referrals,
+            "pending_referrals": pending_referrals,
+            "verified_referrals": verified_referrals,
+            "total_coins_earned": total_coins_earned,
+            "referral_code": referral_code,
+            "referral_link": f"{os.environ.get('FRONTEND_URL', 'https://servicehub.ng')}/signup?ref={referral_code}"
+        }
+
+    async def get_pending_verifications(self, skip: int = 0, limit: int = 20) -> List[dict]:
+        """Get pending document verifications for admin"""
+        cursor = self.user_verifications_collection.find({
+            "status": "pending"
+        }).sort("submitted_at", -1).skip(skip).limit(limit)
+        
+        verifications = []
+        async for verification in cursor:
+            verification["_id"] = str(verification["_id"])
+            
+            # Get user details
+            user = await self.get_user_by_id(verification["user_id"])
+            if user:
+                verification["user_name"] = user.get("name", "Unknown")
+                verification["user_email"] = user.get("email", "Unknown")
+                verification["user_role"] = user.get("role", "Unknown")
+            
+            verifications.append(verification)
+        
+        return verifications
+
+    async def get_user_referrals(self, user_id: str, skip: int = 0, limit: int = 10) -> List[dict]:
+        """Get list of users referred by this user"""
+        cursor = self.referrals_collection.find({
+            "referrer_id": user_id
+        }).sort("created_at", -1).skip(skip).limit(limit)
+        
+        referrals = []
+        async for referral in cursor:
+            referral["_id"] = str(referral["_id"])
+            
+            # Get referred user details
+            referred_user = await self.get_user_by_id(referral["referred_user_id"])
+            if referred_user:
+                referral["referred_user_name"] = referred_user.get("name", "Unknown")
+                referral["referred_user_email"] = referred_user.get("email", "Unknown")
+                referral["referred_user_role"] = referred_user.get("role", "Unknown")
+                referral["is_verified"] = referred_user.get("is_verified", False)
+            
+            referrals.append(referral)
+        
+        return referrals
+
+    async def check_withdrawal_eligibility(self, user_id: str) -> dict:
+        """Check if user is eligible to withdraw referral coins"""
+        wallet = await self.get_wallet_by_user_id(user_id)
+        
+        # Get referral coins
+        referral_transactions = await self.wallet_transactions_collection.find({
+            "user_id": user_id,
+            "transaction_type": "referral_reward",
+            "status": "confirmed"
+        }).to_list(length=None)
+        
+        referral_coins = sum(t.get("amount_coins", 0) for t in referral_transactions)
+        
+        # Check if total wallet balance >= 5 coins (lowered minimum for flexibility)
+        total_coins = wallet.get("balance_coins", 0)
+        can_withdraw = total_coins >= 5
+        
+        return {
+            "total_coins": total_coins,
+            "referral_coins": referral_coins,
+            "regular_coins": total_coins - referral_coins,
+            "can_withdraw_referrals": can_withdraw,
+            "minimum_required": 5,
+            "shortfall": max(0, 5 - total_coins)
+        }
+    
+    # ==========================================
+    # USER MANAGEMENT METHODS (Admin)
+    # ==========================================
+    
+    async def get_all_users_for_admin(self, skip: int = 0, limit: int = 50, role: str = None, status: str = None, search: str = None):
+        """Get all users with filtering for admin dashboard"""
+        
+        # Build query filter
+        query = {}
+        
+        if role:
+            query["role"] = role
+            
+        if status:
+            query["status"] = status
+        else:
+            # Default to active users if no status specified
+            query["status"] = {"$ne": "deleted"}
+            
+        if search:
+            # Search in name, email, phone, or skills
+            query["$or"] = [
+                {"name": {"$regex": search, "$options": "i"}},
+                {"email": {"$regex": search, "$options": "i"}},
+                {"phone": {"$regex": search, "$options": "i"}},
+                {"skills": {"$regex": search, "$options": "i"}}
+            ]
+        
+        # Get users with pagination
+        users_cursor = self.users_collection.find(query).skip(skip).limit(limit).sort("created_at", -1)
+        users = await users_cursor.to_list(length=limit)
+        
+        # Process users to add activity info and remove sensitive data
+        processed_users = []
+        for user in users:
+            user["_id"] = str(user["_id"])
+            user.pop("password_hash", None)  # Remove password hash
+            
+            # Add activity indicators
+            user["last_login"] = user.get("last_login", user.get("created_at"))
+            user["is_verified"] = user.get("is_verified", False)
+            user["wallet_balance"] = 0
+            
+            # Get wallet balance if tradesperson
+            if user.get("role") == "tradesperson":
+                wallet = await self.wallets_collection.find_one({"user_id": user["id"]})
+                if wallet:
+                    user["wallet_balance"] = wallet.get("balance_coins", 0)
+            
+            # Count jobs/interests based on role
+            if user.get("role") == "homeowner":
+                user["jobs_posted"] = await self.database.jobs.count_documents({"homeowner.id": user["id"]})
+            elif user.get("role") == "tradesperson":
+                user["interests_shown"] = await self.database.interests.count_documents({"tradesperson_id": user["id"]})
+            
+            processed_users.append(user)
+        
+        return processed_users
+    
+    async def get_total_users_count(self):
+        """Get total number of registered users"""
+        return await self.users_collection.count_documents({"status": {"$ne": "deleted"}})
+    
+    async def get_active_users_count(self):
+        """Get count of active users (logged in within last 30 days)"""
+        from datetime import datetime, timedelta
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        
+        return await self.users_collection.count_documents({
+            "status": "active",
+            "last_login": {"$gte": thirty_days_ago}
+        })
+    
+    async def get_users_count_by_role(self, role: str):
+        """Get count of users by role"""
+        return await self.users_collection.count_documents({
+            "role": role,
+            "status": {"$ne": "deleted"}
+        })
+    
+    async def get_verified_users_count(self):
+        """Get count of verified users"""
+        return await self.users_collection.count_documents({
+            "is_verified": True,
+            "status": {"$ne": "deleted"}
+        })
+    
+    async def get_user_activity_stats(self, user_id: str):
+        """Get comprehensive activity statistics for a user"""
+        
+        user = await self.get_user_by_id(user_id)
+        if not user:
+            return {}
+        
+        stats = {
+            "registration_date": user.get("created_at"),
+            "last_login": user.get("last_login", user.get("created_at")),
+            "is_verified": user.get("is_verified", False),
+            "status": user.get("status", "active")
+        }
+        
+        if user.get("role") == "homeowner":
+            # Homeowner statistics
+            stats.update({
+                "total_jobs_posted": await self.database.jobs.count_documents({"homeowner.id": user_id}),
+                "active_jobs": await self.database.jobs.count_documents({
+                    "homeowner.id": user_id,
+                    "status": "open"
+                }),
+                "completed_jobs": await self.database.jobs.count_documents({
+                    "homeowner.id": user_id,
+                    "status": "completed"
+                }),
+                "total_interests_received": await self.database.interests.count_documents({
+                    "job.homeowner.id": user_id
+                }),
+                "average_job_budget": await self._get_average_job_budget(user_id)
+            })
+            
+        elif user.get("role") == "tradesperson":
+            # Tradesperson statistics
+            wallet = await self.database.wallets.find_one({"user_id": user_id})
+            
+            stats.update({
+                "total_interests_shown": await self.database.interests.count_documents({"tradesperson_id": user_id}),
+                "wallet_balance_coins": wallet.get("balance_coins", 0) if wallet else 0,
+                "wallet_balance_naira": wallet.get("balance_naira", 0) if wallet else 0,
+                "successful_referrals": await self.database.user_verifications.count_documents({
+                    "referred_by": user_id,
+                    "verification_status": "verified"
+                }),
+                "portfolio_items": await self.database.portfolio.count_documents({"tradesperson_id": user_id}),
+                "average_rating": await self._get_tradesperson_average_rating(user_id),
+                "total_reviews": await self.database.reviews.count_documents({"tradesperson_id": user_id})
+            })
+        
+        return stats
+    
+    async def update_user_status(self, user_id: str, status: str, admin_notes: str = ""):
+        """Update user status with admin notes"""
+        
+        update_data = {
+            "status": status,
+            "updated_at": datetime.now(),
+            "admin_notes": admin_notes
+        }
+        
+        result = await self.users_collection.update_one(
+            {"id": user_id},
+            {"$set": update_data}
+        )
+        
+        return result.modified_count > 0
+    
+    async def _get_average_job_budget(self, homeowner_id: str):
+        """Helper method to calculate average job budget for a homeowner"""
+        
+        pipeline = [
+            {"$match": {"homeowner.id": homeowner_id, "budget": {"$gt": 0}}},
+            {"$group": {"_id": None, "avg_budget": {"$avg": "$budget"}}}
+        ]
+        
+        result = await self.database.jobs.aggregate(pipeline).to_list(length=1)
+        return round(result[0]["avg_budget"], 2) if result else 0
+        
+    async def _get_tradesperson_average_rating(self, tradesperson_id: str):
+        """Helper method to calculate average rating for a tradesperson"""
+        
+        pipeline = [
+            {"$match": {"tradesperson_id": tradesperson_id}},
+            {"$group": {"_id": None, "avg_rating": {"$avg": "$rating"}}}
+        ]
+        
+        result = await self.database.reviews.aggregate(pipeline).to_list(length=1)
+        return round(result[0]["avg_rating"], 1) if result else 0
+    
+    async def get_user_details_admin(self, user_id: str):
+        """Get comprehensive user details for admin management"""
+        
+        try:
+            # Get basic user information
+            user = await self.get_user_by_id(user_id)
+            if not user:
+                return None
+            
+            # Remove password hash for security
+            user.pop("password_hash", None)
+            user["_id"] = str(user.get("_id", ""))
+            
+            # Get activity statistics
+            activity_stats = await self.get_user_activity_stats(user_id)
+            
+            # Get role-specific details
+            if user.get("role") == "homeowner":
+                # Get homeowner-specific data
+                jobs_posted = await self.database.jobs.count_documents({"homeowner.id": user_id})
+                active_jobs = await self.database.jobs.count_documents({
+                    "homeowner.id": user_id,
+                    "status": {"$in": ["active", "open"]}
+                })
+                completed_jobs = await self.database.jobs.count_documents({
+                    "homeowner.id": user_id,
+                    "status": "completed"
+                })
+                total_interests_received = await self.database.interests.count_documents({
+                    "homeowner_id": user_id
+                })
+                
+                user.update({
+                    "jobs_posted": jobs_posted,
+                    "active_jobs": active_jobs,
+                    "completed_jobs": completed_jobs,
+                    "total_interests_received": total_interests_received
+                })
+                
+            elif user.get("role") == "tradesperson":
+                # Get tradesperson-specific data
+                wallet = await self.database.wallets.find_one({"user_id": user_id})
+                interests_shown = await self.database.interests.count_documents({"tradesperson_id": user_id})
+                paid_interests = await self.database.interests.count_documents({
+                    "tradesperson_id": user_id,
+                    "status": "paid_access"
+                })
+                portfolio_items = await self.database.portfolio.count_documents({"tradesperson_id": user_id})
+                reviews_count = await self.database.reviews.count_documents({"reviewee_id": user_id})
+                average_rating = await self._get_tradesperson_average_rating(user_id)
+                
+                # Get recent transactions
+                transactions = await self.database.wallet_transactions.find(
+                    {"user_id": user_id}
+                ).sort("created_at", -1).limit(10).to_list(length=10)
+                
+                user.update({
+                    "wallet_balance_coins": wallet.get("balance_coins", 0) if wallet else 0,
+                    "wallet_balance_naira": wallet.get("balance_naira", 0) if wallet else 0,
+                    "interests_shown": interests_shown,
+                    "paid_interests": paid_interests,
+                    "portfolio_items": portfolio_items,
+                    "reviews_count": reviews_count,
+                    "average_rating": average_rating,
+                    "recent_transactions": [
+                        {
+                            "id": str(tx.get("_id", "")),
+                            "type": tx.get("transaction_type", ""),
+                            "amount_coins": tx.get("amount_coins", 0),
+                            "amount_naira": tx.get("amount_naira", 0),
+                            "description": tx.get("description", ""),
+                            "status": tx.get("status", ""),
+                            "created_at": tx.get("created_at")
+                        } for tx in transactions
+                    ]
+                })
+            
+            # Add verification status
+            verification = await self.database.user_verifications.find_one({"user_id": user_id})
+            if verification:
+                user.update({
+                    "verification_status": verification.get("verification_status", "unverified"),
+                    "document_type": verification.get("document_type", ""),
+                    "verified_at": verification.get("verified_at"),
+                    "verification_notes": verification.get("admin_notes", "")
+                })
+            else:
+                user.update({
+                    "verification_status": "unverified",
+                    "document_type": "",
+                    "verified_at": None,
+                    "verification_notes": ""
+                })
+            
+            # Get recent activity based on role
+            if user.get("role") == "homeowner":
+                recent_jobs = await self.database.jobs.find(
+                    {"homeowner.id": user_id}
+                ).sort("created_at", -1).limit(5).to_list(length=5)
+                
+                user["recent_jobs"] = [
+                    {
+                        "id": job.get("id", ""),
+                        "title": job.get("title", ""),
+                        "category": job.get("category", ""),
+                        "status": job.get("status", ""),
+                        "created_at": job.get("created_at"),
+                        "interests_count": await self.database.interests.count_documents({"job_id": job.get("id", "")})
+                    } for job in recent_jobs
+                ]
+            
+            elif user.get("role") == "tradesperson":
+                recent_interests = await self.database.interests.find(
+                    {"tradesperson_id": user_id}
+                ).sort("created_at", -1).limit(5).to_list(length=5)
+                
+                user["recent_interests"] = [
+                    {
+                        "id": str(interest.get("_id", "")),
+                        "job_title": interest.get("job_title", ""),
+                        "job_category": interest.get("job_category", ""),
+                        "status": interest.get("status", ""),
+                        "created_at": interest.get("created_at"),
+                        "contact_shared_at": interest.get("contact_shared_at"),
+                        "payment_made_at": interest.get("payment_made_at")
+                    } for interest in recent_interests
+                ]
+            
+            # Combine with activity stats
+            user.update(activity_stats)
+            
+            return user
+            
+        except Exception as e:
+            logger.error(f"Error getting user details for admin: {str(e)}")
+            return None
+    
+    async def delete_user_completely(self, user_id: str):
+        """Permanently delete user and all associated data"""
+        
+        try:
+            # Get user details first for logging
+            user = await self.get_user_by_id(user_id)
+            if not user:
+                return False
+            
+            # Check if user is admin - prevent deletion of admin accounts
+            if user.get("role") == "admin":
+                logger.warning(f"Attempted to delete admin user: {user.get('email', 'Unknown')}")
+                return False
+            
+            # Delete from all related collections
+            collections_to_clean = [
+                ("jobs", {"homeowner.id": user_id}),
+                ("jobs", {"$or": [{"homeowner_id": user_id}, {"homeowner.id": user_id}]}),
+                ("interests", {"tradesperson_id": user_id}),
+                ("interests", {"homeowner_id": user_id}),
+                ("wallets", {"user_id": user_id}),
+                ("wallet_transactions", {"user_id": user_id}),
+                ("portfolio", {"tradesperson_id": user_id}),
+                ("reviews", {"reviewer_id": user_id}),
+                ("reviews", {"reviewee_id": user_id}),
+                ("conversations", {"participants": user_id}),
+                ("messages", {"sender_id": user_id}),
+                ("notifications", {"user_id": user_id}),
+                ("notification_preferences", {"user_id": user_id}),
+                ("user_verifications", {"user_id": user_id})
+            ]
+            
+            # Delete from all related collections
+            for collection_name, query in collections_to_clean:
+                try:
+                    collection = getattr(self.database, collection_name)
+                    result = await collection.delete_many(query)
+                    if result.deleted_count > 0:
+                        logger.info(f"Deleted {result.deleted_count} records from {collection_name} for user {user_id}")
+                except Exception as e:
+                    logger.warning(f"Error deleting from {collection_name}: {str(e)}")
+                    # Continue with deletion even if some collections fail
+            
+            # Finally delete the user account
+            result = await self.users_collection.delete_one({"id": user_id})
+            
+            if result.deleted_count > 0:
+                logger.info(f"Successfully deleted user account: {user.get('email', 'Unknown')} (ID: {user_id})")
+                return True
+            else:
+                logger.error(f"Failed to delete user account: {user_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error deleting user completely: {str(e)}")
+            return False
+    
+    # ==========================================
+    # LOCATION MANAGEMENT METHODS (Admin)
+    # ==========================================
+    
+    async def get_custom_lgas(self):
+        """Get custom LGAs added by admin, organized by state"""
+        try:
+            lgas_cursor = self.database.system_locations.find({"type": "lga"})
+            lgas = await lgas_cursor.to_list(length=None)
+            
+            # Organize by state
+            lgas_by_state = {}
+            for lga in lgas:
+                state = lga["state"]
+                if state not in lgas_by_state:
+                    lgas_by_state[state] = []
+                lgas_by_state[state].append(lga["name"])
+            
+            return lgas_by_state
+        except Exception as e:
+            print(f"Error getting custom LGAs: {e}")
+            return {}
+    
+    async def get_custom_states(self):
+        """Get custom states added by admin"""
+        try:
+            states_cursor = self.database.system_locations.find({"type": "state"})
+            states = await states_cursor.to_list(length=None)
+            return [state["name"] for state in states]
+        except Exception as e:
+            print(f"Error getting custom states: {e}")
+            return []
+    
+    async def add_new_state(self, state_name: str, region: str = "", postcode_samples: str = ""):
+        """Add a new state to the system"""
+        try:
+            # In a real implementation, this would update files or database
+            # For now, we'll store in a collection
+            state_doc = {
+                "name": state_name,
+                "region": region,
+                "postcode_samples": postcode_samples.split(",") if postcode_samples else [],
+                "created_at": datetime.now(),
+                "type": "state"
+            }
+            
+            # Check if state already exists
+            existing = await self.database.system_locations.find_one({"name": state_name, "type": "state"})
+            if existing:
+                return False
+            
+            await self.database.system_locations.insert_one(state_doc)
+            return True
+        except Exception as e:
+            print(f"Error adding state: {e}")
+            return False
+    
+    async def update_state(self, old_name: str, new_name: str, region: str = "", postcode_samples: str = ""):
+        """Update an existing state"""
+        try:
+            update_data = {
+                "name": new_name,
+                "region": region,
+                "postcode_samples": postcode_samples.split(",") if postcode_samples else [],
+                "updated_at": datetime.now()
+            }
+            
+            result = await self.database.system_locations.update_one(
+                {"name": old_name, "type": "state"},
+                {"$set": update_data}
+            )
+            
+            # Also update LGAs that reference this state
+            if result.modified_count > 0:
+                await self.database.system_locations.update_many(
+                    {"state": old_name, "type": "lga"},
+                    {"$set": {"state": new_name}}
+                )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating state: {e}")
+            return False
+    
+    async def delete_state(self, state_name: str):
+        """Delete a state and all its LGAs"""
+        try:
+            # Delete all LGAs for this state
+            await self.database.system_locations.delete_many({"state": state_name, "type": "lga"})
+            
+            # Delete all towns for this state
+            await self.database.system_locations.delete_many({"state": state_name, "type": "town"})
+            
+            # Delete the state
+            result = await self.database.system_locations.delete_one({"name": state_name, "type": "state"})
+            
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"Error deleting state: {e}")
+            return False
+    
+    async def add_new_lga(self, state_name: str, lga_name: str, zip_codes: str = ""):
+        """Add a new LGA to a state"""
+        try:
+            # Check if state exists in either static list or database
+            from models.nigerian_states import NIGERIAN_STATES
+            state_exists_static = state_name in NIGERIAN_STATES
+            
+            # Also check database for custom states
+            state_exists_db = await self.database.system_locations.find_one({
+                "name": state_name,
+                "type": "state"
+            })
+            
+            if not (state_exists_static or state_exists_db):
+                print(f"State '{state_name}' not found in static list or database")
+                return False
+            
+            lga_doc = {
+                "name": lga_name,
+                "state": state_name,
+                "zip_codes": zip_codes.split(",") if zip_codes else [],
+                "created_at": datetime.now(),
+                "type": "lga"
+            }
+            
+            # Check if LGA already exists in this state
+            existing = await self.database.system_locations.find_one({
+                "name": lga_name, 
+                "state": state_name, 
+                "type": "lga"
+            })
+            if existing:
+                print(f"LGA '{lga_name}' already exists in state '{state_name}'")
+                return False
+            
+            await self.database.system_locations.insert_one(lga_doc)
+            return True
+        except Exception as e:
+            print(f"Error adding LGA: {e}")
+            return False
+    
+    async def update_lga(self, state_name: str, old_name: str, new_name: str, zip_codes: str = ""):
+        """Update an existing LGA"""
+        try:
+            update_data = {
+                "name": new_name,
+                "zip_codes": zip_codes.split(",") if zip_codes else [],
+                "updated_at": datetime.now()
+            }
+            
+            result = await self.database.system_locations.update_one(
+                {"name": old_name, "state": state_name, "type": "lga"},
+                {"$set": update_data}
+            )
+            
+            # Also update towns that reference this LGA
+            if result.modified_count > 0:
+                await self.database.system_locations.update_many(
+                    {"lga": old_name, "state": state_name, "type": "town"},
+                    {"$set": {"lga": new_name}}
+                )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating LGA: {e}")
+            return False
+    
+    async def delete_lga(self, state_name: str, lga_name: str):
+        """Delete an LGA and all its towns"""
+        try:
+            # Delete all towns for this LGA
+            await self.database.system_locations.delete_many({
+                "state": state_name, 
+                "lga": lga_name, 
+                "type": "town"
+            })
+            
+            # Delete the LGA
+            result = await self.database.system_locations.delete_one({
+                "name": lga_name, 
+                "state": state_name, 
+                "type": "lga"
+            })
+            
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"Error deleting LGA: {e}")
+            return False
+    
+    async def get_all_towns(self):
+        """Get all towns organized by state and LGA"""
+        try:
+            towns_cursor = self.database.system_locations.find({"type": "town"})
+            towns = await towns_cursor.to_list(length=None)
+            
+            # Organize by state and LGA
+            organized_towns = {}
+            for town in towns:
+                state = town.get("state", "Unknown")
+                lga = town.get("lga", "Unknown")
+                town_name = town.get("name", "")
+                
+                if state not in organized_towns:
+                    organized_towns[state] = {}
+                
+                if lga not in organized_towns[state]:
+                    organized_towns[state][lga] = []
+                
+                organized_towns[state][lga].append({
+                    "name": town_name,
+                    "zip_code": town.get("zip_code", ""),
+                    "created_at": town.get("created_at")
+                })
+            
+            return organized_towns
+        except Exception as e:
+            print(f"Error getting towns: {e}")
+            return {}
+    
+    async def add_new_town(self, state_name: str, lga_name: str, town_name: str, zip_code: str = ""):
+        """Add a new town to an LGA"""
+        try:
+            # Check if LGA exists in static data or database
+            from models.nigerian_lgas import get_lgas_for_state
+            static_lgas = get_lgas_for_state(state_name)
+            lga_exists_static = lga_name in static_lgas if static_lgas else False
+            
+            # Also check database for custom LGAs
+            lga_exists_db = await self.database.system_locations.find_one({
+                "name": lga_name, 
+                "state": state_name, 
+                "type": "lga"
+            })
+            
+            if not (lga_exists_static or lga_exists_db):
+                return False
+            
+            town_doc = {
+                "name": town_name,
+                "state": state_name,
+                "lga": lga_name,
+                "zip_code": zip_code,
+                "created_at": datetime.now(),
+                "type": "town"
+            }
+            
+            await self.database.system_locations.insert_one(town_doc)
+            return True
+        except Exception as e:
+            print(f"Error adding town: {e}")
+            return False
+    
+    async def delete_town(self, state_name: str, lga_name: str, town_name: str):
+        """Delete a town"""
+        try:
+            result = await self.database.system_locations.delete_one({
+                "name": town_name,
+                "state": state_name,
+                "lga": lga_name,
+                "type": "town"
+            })
+            
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"Error deleting town: {e}")
+            return False
+    
+    # ==========================================
+    # TRADE CATEGORIES MANAGEMENT METHODS (Admin)
+    # ==========================================
+    
+    async def add_new_trade(self, trade_name: str, group: str = "", description: str = ""):
+        """Add a new trade category"""
+        try:
+            trade_doc = {
+                "name": trade_name,
+                "group": group,
+                "description": description,
+                "created_at": datetime.now(),
+                "active": True
+            }
+            
+            # Check if trade already exists
+            existing = await self.database.system_trades.find_one({"name": trade_name})
+            if existing:
+                return False
+            
+            await self.database.system_trades.insert_one(trade_doc)
+            return True
+        except Exception as e:
+            print(f"Error adding trade: {e}")
+            return False
+    
+    async def update_trade(self, old_name: str, new_name: str, group: str = "", description: str = ""):
+        """Update an existing trade category"""
+        try:
+            update_data = {
+                "name": new_name,
+                "group": group,
+                "description": description,
+                "updated_at": datetime.now()
+            }
+            
+            result = await self.database.system_trades.update_one(
+                {"name": old_name},
+                {"$set": update_data}
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating trade: {e}")
+            return False
+    
+    async def delete_trade(self, trade_name: str):
+        """Delete a trade category"""
+        try:
+            result = await self.database.system_trades.delete_one({"name": trade_name})
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"Error deleting trade: {e}")
+            return False
+    
+    async def get_custom_trades(self):
+        """Get all custom trade categories added by admin"""
+        try:
+            trades = await self.database.system_trades.find({"active": True}).to_list(length=None)
+            trade_list = []
+            groups = {}
+            
+            for trade in trades:
+                trade_name = trade["name"]
+                trade_group = trade.get("group", "General Services")
+                
+                trade_list.append(trade_name)
+                
+                # Group trades by category
+                if trade_group not in groups:
+                    groups[trade_group] = []
+                groups[trade_group].append(trade_name)
+            
+            return {"trades": trade_list, "groups": groups}
+        except Exception as e:
+            print(f"Error getting custom trades: {e}")
+            return {"trades": [], "groups": {}}
+
+    # ==========================================
+    # MESSAGING SYSTEM METHODS
+    # ==========================================
+    
+    async def create_conversation(self, conversation_data: dict) -> dict:
+        """Create a new conversation between homeowner and tradesperson"""
+        try:
+            # Check if conversation already exists
+            existing = await self.database.conversations.find_one({
+                "job_id": conversation_data["job_id"],
+                "homeowner_id": conversation_data["homeowner_id"],
+                "tradesperson_id": conversation_data["tradesperson_id"]
+            })
+            
+            if existing:
+                existing['_id'] = str(existing['_id'])
+                return existing
+            
+            conversation_data["created_at"] = datetime.now()
+            conversation_data["updated_at"] = datetime.now()
+            conversation_data["unread_count_homeowner"] = 0
+            conversation_data["unread_count_tradesperson"] = 0
+            
+            result = await self.database.conversations.insert_one(conversation_data)
+            conversation_data['_id'] = str(result.inserted_id)
+            return conversation_data
+            
+        except Exception as e:
+            print(f"Error creating conversation: {e}")
+            return None
+    
+    async def get_conversation_by_id(self, conversation_id: str) -> Optional[dict]:
+        """Get conversation by ID"""
+        try:
+            conversation = await self.database.conversations.find_one({"id": conversation_id})
+            if conversation:
+                conversation['_id'] = str(conversation['_id'])
+            return conversation
+        except Exception as e:
+            print(f"Error getting conversation: {e}")
+            return None
+    
+    async def get_user_conversations(self, user_id: str, user_type: str, skip: int = 0, limit: int = 20) -> List[dict]:
+        """Get all conversations for a user"""
+        try:
+            if user_type == "homeowner":
+                query = {"homeowner_id": user_id}
+            else:
+                query = {"tradesperson_id": user_id}
+            
+            cursor = self.database.conversations.find(query).sort("last_message_at", -1).skip(skip).limit(limit)
+            conversations = await cursor.to_list(length=limit)
+            
+            for conv in conversations:
+                conv['_id'] = str(conv['_id'])
+            
+            return conversations
+        except Exception as e:
+            print(f"Error getting user conversations: {e}")
+            return []
+    
+    async def create_message(self, message_data: dict) -> dict:
+        """Create a new message"""
+        try:
+            message_data["created_at"] = datetime.now()
+            message_data["updated_at"] = datetime.now()
+            message_data["status"] = "sent"
+            
+            result = await self.database.messages.insert_one(message_data)
+            message_data['_id'] = str(result.inserted_id)
+            
+            # Update conversation last message and unread counts
+            await self._update_conversation_last_message(
+                message_data["conversation_id"], 
+                message_data["content"],
+                message_data["sender_type"]
+            )
+            
+            return message_data
+            
+        except Exception as e:
+            print(f"Error creating message: {e}")
+            return None
+    
+    async def get_conversation_messages(self, conversation_id: str, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get messages for a conversation"""
+        try:
+            cursor = self.database.messages.find(
+                {"conversation_id": conversation_id}
+            ).sort("created_at", 1).skip(skip).limit(limit)
+            
+            messages = await cursor.to_list(length=limit)
+            
+            for msg in messages:
+                msg['_id'] = str(msg['_id'])
+            
+            return messages
+        except Exception as e:
+            print(f"Error getting conversation messages: {e}")
+            return []
+    
+    async def mark_messages_as_read(self, conversation_id: str, user_type: str) -> bool:
+        """Mark all messages in a conversation as read for a user"""
+        try:
+            # Update message status to read for messages not sent by this user
+            other_type = "homeowner" if user_type == "tradesperson" else "tradesperson"
+            
+            await self.database.messages.update_many(
+                {
+                    "conversation_id": conversation_id,
+                    "sender_type": other_type,
+                    "status": {"$ne": "read"}
+                },
+                {"$set": {"status": "read", "updated_at": datetime.now()}}
+            )
+            
+            # Reset unread count for this user type
+            unread_field = f"unread_count_{user_type}"
+            await self.database.conversations.update_one(
+                {"id": conversation_id},
+                {"$set": {unread_field: 0}}
+            )
+            
+            return True
+        except Exception as e:
+            print(f"Error marking messages as read: {e}")
+            return False
+    
+    async def get_conversation_by_job_and_users(self, job_id: str, homeowner_id: str, tradesperson_id: str) -> Optional[dict]:
+        """Get conversation by job and user IDs"""
+        try:
+            conversation = await self.database.conversations.find_one({
+                "job_id": job_id,
+                "homeowner_id": homeowner_id,
+                "tradesperson_id": tradesperson_id
+            })
+            
+            if conversation:
+                conversation['_id'] = str(conversation['_id'])
+            return conversation
+        except Exception as e:
+            print(f"Error getting conversation by job and users: {e}")
+            return None
+    
+    async def _update_conversation_last_message(self, conversation_id: str, message_content: str, sender_type: str):
+        """Update conversation with last message info and increment unread count"""
+        try:
+            # Increment unread count for the recipient
+            recipient_unread_field = "unread_count_homeowner" if sender_type == "tradesperson" else "unread_count_tradesperson"
+            
+            await self.database.conversations.update_one(
+                {"id": conversation_id},
+                {
+                    "$set": {
+                        "last_message": message_content,
+                        "last_message_at": datetime.now(),
+                        "updated_at": datetime.now()
+                    },
+                    "$inc": {recipient_unread_field: 1}
+                }
+            )
+        except Exception as e:
+            print(f"Error updating conversation last message: {e}")
+
+    # Skills Test Questions Management
+    async def get_all_skills_questions(self):
+        """Get all skills test questions grouped by trade"""
+        try:
+            questions = await self.database.skills_questions.find().to_list(length=None)
+            
+            # Convert ObjectIds to strings for JSON serialization
+            for question in questions:
+                if '_id' in question:
+                    question['_id'] = str(question['_id'])
+            
+            # Group questions by trade
+            questions_by_trade = {}
+            for question in questions:
+                trade = question.get('trade_category', 'Unknown')
+                if trade not in questions_by_trade:
+                    questions_by_trade[trade] = []
+                questions_by_trade[trade].append(question)
+            
+            return questions_by_trade
+        except Exception as e:
+            logger.error(f"Error getting skills questions: {str(e)}")
+            return {}
+    
+    async def get_questions_for_trade(self, trade_category: str):
+        """Get all questions for a specific trade, with JS-file fallback when DB unavailable"""
+        # Prefer database when connected
+        if self.database is not None and self.connected:
+            try:
+                questions = await self.database.skills_questions.find(
+                    {"trade_category": trade_category}
+                ).to_list(length=None)
+                # Convert ObjectIds to strings for JSON serialization
+                for question in questions:
+                    if '_id' in question:
+                        question['_id'] = str(question['_id'])
+                if questions:
+                    return questions
+            except Exception as e:
+                logger.error(f"Error getting questions for trade {trade_category}: {e}")
+        
+        # Fallback: read from frontend JS file
+        try:
+            import re, json
+            js_file_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                'frontend', 'src', 'data', 'skillsTestQuestions.js'
+            )
+            if not os.path.exists(js_file_path):
+                logger.error(f"JS skills questions file not found at {js_file_path}")
+                return []
+            with open(js_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            match = re.search(r"export const skillsTestQuestions\s*=\s*({[\s\S]*?});", content)
+            if not match:
+                logger.error("Could not locate skillsTestQuestions object in JS file")
+                return []
+            questions_str = match.group(1)
+            # Normalize JS to JSON-like string
+            questions_str = re.sub(r"(\w+)\s*:", r"\"\\1\":", questions_str)
+            questions_str = questions_str.replace("'", '"')
+            js_data = json.loads(questions_str)
+            trade_questions = js_data.get(trade_category, [])
+            # Convert to DB-like schema expected by routes
+            formatted = []
+            for q in trade_questions:
+                formatted.append({
+                    "id": str(uuid.uuid4()),
+                    "trade_category": trade_category,
+                    "question": q.get("question"),
+                    "options": q.get("options", []),
+                    "correct_answer": q.get("correct", 0),
+                    "category": q.get("category", "General"),
+                    "explanation": q.get("explanation", ""),
+                    "difficulty": q.get("difficulty", "Medium"),
+                    "created_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat(),
+                    "created_by": "system",
+                    "is_active": True
+                })
+            return formatted
+        except Exception as e:
+            logger.error(f"Fallback load from JS failed for {trade_category}: {e}")
+            return []
+    
+    async def add_skills_question(self, trade_category: str, question_data: dict):
+        """Add a new skills test question"""
+        try:
+            question_doc = {
+                "id": str(uuid.uuid4()),
+                "trade_category": trade_category,
+                "question": question_data.get('question'),
+                "options": question_data.get('options', []),
+                "correct_answer": question_data.get('correct_answer', 0),
+                "category": question_data.get('category', 'General'),
+                "explanation": question_data.get('explanation', ''),
+                "difficulty": question_data.get('difficulty', 'Medium'),
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "created_by": "admin",
+                "is_active": True
+            }
+            
+            result = await self.database.skills_questions.insert_one(question_doc)
+            return question_doc['id']  # Return the UUID instead of ObjectId
+        except Exception as e:
+            print(f"Error adding skills question: {e}")
+            return None
+    
+    async def update_skills_question(self, question_id: str, question_data: dict):
+        """Update an existing skills test question"""
+        try:
+            update_data = {
+                "question": question_data.get('question'),
+                "options": question_data.get('options', []),
+                "correct_answer": question_data.get('correct_answer', 0),
+                "category": question_data.get('category', 'General'),
+                "explanation": question_data.get('explanation', ''),
+                "difficulty": question_data.get('difficulty', 'Medium'),
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            result = await self.database.skills_questions.update_one(
+                {"id": question_id},
+                {"$set": update_data}
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating skills question: {e}")
+            return False
+    
+    async def delete_skills_question(self, question_id: str):
+        """Delete a skills test question"""
+        try:
+            result = await self.database.skills_questions.delete_one({"id": question_id})
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"Error deleting skills question: {e}")
+            return False
+    
+    async def get_question_stats(self):
+        """Get statistics about skills questions"""
+        try:
+            pipeline = [
+                {
+                    "$group": {
+                        "_id": "$trade_category",
+                        "count": {"$sum": 1},
+                        "active_count": {
+                            "$sum": {"$cond": [{"$eq": ["$is_active", True]}, 1, 0]}
+                        }
+                    }
+                }
+            ]
+            
+            stats = await self.database.skills_questions.aggregate(pipeline).to_list(length=None)
+            
+            # Convert ObjectIds and structure the response
+            result = {}
+            for stat in stats:
+                trade_name = stat['_id']
+                result[trade_name] = {
+                    'count': stat['count'],
+                    'active_count': stat['active_count']
+                }
+            
+            return result
+        except Exception as e:
+            print(f"Error getting question stats: {e}")
+            return {}
+    
+    # Policy Management Methods
+    async def get_all_policies(self):
+        """Get all current active policies"""
+        try:
+            # Use $or instead of $in as there seems to be an issue with $in operator
+            policies = await self.database.policies.find(
+                {"$or": [{"status": "active"}, {"status": "scheduled"}]}
+            ).sort("policy_type", 1).to_list(length=None)
+            
+            # Convert ObjectIds to strings for JSON serialization
+            for policy in policies:
+                if '_id' in policy:
+                    policy['_id'] = str(policy['_id'])
+            
+            return policies
+        except Exception as e:
+            print(f"Error getting policies: {e}")
+            return []
+    
+    async def get_policy_by_type(self, policy_type: str):
+        """Get current active policy by type"""
+        try:
+            policy = await self.database.policies.find_one({
+                "policy_type": policy_type,
+                "status": "active"
+            })
+            
+            if policy and '_id' in policy:
+                policy['_id'] = str(policy['_id'])
+            
+            return policy
+        except Exception as e:
+            print(f"Error getting policy {policy_type}: {e}")
+            return None
+    
+    async def get_policy_by_id(self, policy_id: str):
+        """Get policy by ID"""
+        try:
+            policy = await self.database.policies.find_one({"id": policy_id})
+            
+            if policy and '_id' in policy:
+                policy['_id'] = str(policy['_id'])
+            
+            return policy
+        except Exception as e:
+            print(f"Error getting policy {policy_id}: {e}")
+            return None
+    
+    async def create_policy(self, policy_data: dict, created_by: str):
+        """Create a new policy version"""
+        try:
+            # Check if there's an existing active policy of this type
+            existing_policy = await self.database.policies.find_one({
+                "policy_type": policy_data["policy_type"],
+                "status": "active"
+            })
+            
+            # Get next version number
+            version = 1
+            if existing_policy:
+                # Archive the existing active policy
+                await self.archive_policy(existing_policy["id"], created_by)
+                version = existing_policy.get("version", 0) + 1
+            
+            # Determine status based on effective_date
+            status = "draft"
+            if policy_data.get("effective_date"):
+                effective_date = policy_data["effective_date"]
+                if isinstance(effective_date, str):
+                    effective_date = datetime.fromisoformat(effective_date.replace('Z', '+00:00'))
+                
+                if effective_date <= datetime.now():
+                    status = "active"
+                else:
+                    status = "scheduled"
+            else:
+                status = "active"  # Immediate activation if no date specified
+            
+            policy_doc = {
+                "id": str(uuid.uuid4()),
+                "policy_type": policy_data["policy_type"],
+                "title": policy_data["title"],
+                "content": policy_data["content"],
+                "status": status,
+                "version": version,
+                "effective_date": policy_data.get("effective_date"),
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "created_by": created_by,
+                "notes": policy_data.get("notes", "")
+            }
+            
+            result = await self.database.policies.insert_one(policy_doc)
+            
+            if result.inserted_id:
+                return policy_doc["id"]
+            return None
+            
+        except Exception as e:
+            print(f"Error creating policy: {e}")
+            return None
+    
+    async def update_policy(self, policy_id: str, policy_data: dict, updated_by: str):
+        """Update an existing policy"""
+        try:
+            existing_policy = await self.get_policy_by_id(policy_id)
+            if not existing_policy:
+                return False
+            
+            # Archive current version if it's active
+            if existing_policy["status"] == "active":
+                await self.archive_policy(policy_id, updated_by)
+                # Create new version
+                new_version = existing_policy["version"] + 1
+            else:
+                # Update in place if not active
+                new_version = existing_policy["version"]
+            
+            update_data = {
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            # Update fields if provided
+            if "title" in policy_data:
+                update_data["title"] = policy_data["title"]
+            if "content" in policy_data:
+                update_data["content"] = policy_data["content"]
+            if "notes" in policy_data:
+                update_data["notes"] = policy_data["notes"]
+            if "effective_date" in policy_data:
+                update_data["effective_date"] = policy_data["effective_date"]
+                
+                # Update status based on effective date
+                if policy_data["effective_date"]:
+                    effective_date = policy_data["effective_date"]
+                    if isinstance(effective_date, str):
+                        effective_date = datetime.fromisoformat(effective_date.replace('Z', '+00:00'))
+                    
+                    if effective_date <= datetime.now():
+                        update_data["status"] = "active"
+                    else:
+                        update_data["status"] = "scheduled"
+            
+            if "status" in policy_data:
+                update_data["status"] = policy_data["status"]
+            
+            # If creating new version
+            if existing_policy["status"] == "active":
+                update_data["version"] = new_version
+                update_data["id"] = str(uuid.uuid4())
+                result = await self.database.policies.insert_one(update_data)
+                return result.inserted_id is not None
+            else:
+                # Update existing
+                result = await self.database.policies.update_one(
+                    {"id": policy_id},
+                    {"$set": update_data}
+                )
+                return result.modified_count > 0
+            
+        except Exception as e:
+            print(f"Error updating policy {policy_id}: {e}")
+            return False
+    
+    async def archive_policy(self, policy_id: str, archived_by: str):
+        """Archive a policy (move to history)"""
+        try:
+            policy = await self.get_policy_by_id(policy_id)
+            if not policy:
+                return False
+            
+            # Create history record
+            history_doc = {
+                "policy_id": policy["id"],
+                "policy_type": policy["policy_type"],
+                "title": policy["title"],
+                "content": policy["content"],
+                "version": policy["version"],
+                "effective_date": policy.get("effective_date"),
+                "created_at": policy["created_at"],
+                "created_by": policy["created_by"],
+                "notes": policy.get("notes", ""),
+                "archived_at": datetime.now().isoformat(),
+                "archived_by": archived_by
+            }
+            
+            # Insert into history collection
+            await self.database.policy_history.insert_one(history_doc)
+            
+            # Update policy status to archived
+            result = await self.database.policies.update_one(
+                {"id": policy_id},
+                {"$set": {"status": "archived", "updated_at": datetime.now().isoformat()}}
+            )
+            
+            return result.modified_count > 0
+            
+        except Exception as e:
+            print(f"Error archiving policy {policy_id}: {e}")
+            return False
+    
+    async def get_policy_history(self, policy_type: str):
+        """Get version history for a policy type"""
+        try:
+            history = await self.database.policy_history.find(
+                {"policy_type": policy_type}
+            ).sort("version", -1).to_list(length=None)
+            
+            # Convert ObjectIds to strings for JSON serialization
+            for record in history:
+                if '_id' in record:
+                    record['_id'] = str(record['_id'])
+            
+            return history
+        except Exception as e:
+            print(f"Error getting policy history for {policy_type}: {e}")
+            return []
+    
+    async def restore_policy_version(self, policy_type: str, version: int, restored_by: str):
+        """Restore a specific version of a policy"""
+        try:
+            # Get the version from history
+            history_record = await self.database.policy_history.find_one({
+                "policy_type": policy_type,
+                "version": version
+            })
+            
+            if not history_record:
+                return None
+            
+            # Archive current active policy
+            current_policy = await self.get_policy_by_type(policy_type)
+            if current_policy:
+                await self.archive_policy(current_policy["id"], restored_by)
+            
+            # Create new policy from history
+            new_version = current_policy["version"] + 1 if current_policy else 1
+            
+            policy_doc = {
+                "id": str(uuid.uuid4()),
+                "policy_type": history_record["policy_type"],
+                "title": history_record["title"],
+                "content": history_record["content"],
+                "status": "active",
+                "version": new_version,
+                "effective_date": None,  # Restore immediately
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "created_by": restored_by,
+                "notes": f"Restored from version {version}"
+            }
+            
+            result = await self.database.policies.insert_one(policy_doc)
+            
+            if result.inserted_id:
+                return policy_doc["id"]
+            return None
+            
+        except Exception as e:
+            print(f"Error restoring policy version: {e}")
+            return None
+    
+    async def delete_policy(self, policy_id: str):
+        """Delete a policy (only drafts can be deleted)"""
+        try:
+            policy = await self.get_policy_by_id(policy_id)
+            if not policy or policy["status"] != "draft":
+                return False
+            
+            result = await self.database.policies.delete_one({"id": policy_id})
+            return result.deleted_count > 0
+            
+        except Exception as e:
+            print(f"Error deleting policy {policy_id}: {e}")
+            return False
+    
+    async def activate_scheduled_policies(self):
+        """Activate policies that have reached their effective date (for background task)"""
+        try:
+            current_time = datetime.now()
+            
+            # Find scheduled policies with effective_date <= now
+            scheduled_policies = await self.database.policies.find({
+                "status": "scheduled",
+                "effective_date": {"$lte": current_time.isoformat()}
+            }).to_list(length=None)
+            
+            activated_count = 0
+            
+            for policy in scheduled_policies:
+                # Archive any existing active policy of the same type
+                existing_active = await self.database.policies.find_one({
+                    "policy_type": policy["policy_type"],
+                    "status": "active"
+                })
+                
+                if existing_active:
+                    await self.archive_policy(existing_active["id"], "system")
+                
+                # Activate the scheduled policy
+                await self.database.policies.update_one(
+                    {"id": policy["id"]},
+                    {"$set": {"status": "active", "updated_at": current_time.isoformat()}}
+                )
+                
+                activated_count += 1
+            
+            return activated_count
+            
+        except Exception as e:
+            print(f"Error activating scheduled policies: {e}")
+            return 0
+    
+    # Contact Management Methods
+    async def get_all_contacts(self):
+        """Get all contacts grouped by type"""
+        try:
+            contacts = await self.database.contacts.find(
+                {"is_active": True}
+            ).sort([("contact_type", 1), ("display_order", 1)]).to_list(length=None)
+            
+            # Convert ObjectIds to strings for JSON serialization
+            for contact in contacts:
+                if '_id' in contact:
+                    contact['_id'] = str(contact['_id'])
+            
+            return contacts
+        except Exception as e:
+            print(f"Error getting contacts: {e}")
+            return []
+    
+    async def get_contacts_by_type(self, contact_type: str):
+        """Get contacts by specific type"""
+        try:
+            contacts = await self.database.contacts.find({
+                "contact_type": contact_type,
+                "is_active": True
+            }).sort("display_order", 1).to_list(length=None)
+            
+            # Convert ObjectIds to strings for JSON serialization
+            for contact in contacts:
+                if '_id' in contact:
+                    contact['_id'] = str(contact['_id'])
+            
+            return contacts
+        except Exception as e:
+            print(f"Error getting contacts by type {contact_type}: {e}")
+            return []
+    
+    async def get_contact_by_id(self, contact_id: str):
+        """Get contact by ID"""
+        try:
+            contact = await self.database.contacts.find_one({"id": contact_id})
+            
+            if contact and '_id' in contact:
+                contact['_id'] = str(contact['_id'])
+            
+            return contact
+        except Exception as e:
+            print(f"Error getting contact {contact_id}: {e}")
+            return None
+    
+    async def create_contact(self, contact_data: dict, created_by: str):
+        """Create a new contact"""
+        try:
+            contact_doc = {
+                "id": str(uuid.uuid4()),
+                "contact_type": contact_data["contact_type"],
+                "label": contact_data["label"],
+                "value": contact_data["value"],
+                "is_active": contact_data.get("is_active", True),
+                "display_order": contact_data.get("display_order", 0),
+                "notes": contact_data.get("notes", ""),
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "updated_by": created_by
+            }
+            
+            result = await self.database.contacts.insert_one(contact_doc)
+            
+            if result.inserted_id:
+                return contact_doc["id"]
+            return None
+            
+        except Exception as e:
+            print(f"Error creating contact: {e}")
+            return None
+    
+    async def update_contact(self, contact_id: str, contact_data: dict, updated_by: str):
+        """Update an existing contact"""
+        try:
+            update_data = {
+                "updated_at": datetime.now().isoformat(),
+                "updated_by": updated_by
+            }
+            
+            # Update fields if provided
+            if "label" in contact_data:
+                update_data["label"] = contact_data["label"]
+            if "value" in contact_data:
+                update_data["value"] = contact_data["value"]
+            if "is_active" in contact_data:
+                update_data["is_active"] = contact_data["is_active"]
+            if "display_order" in contact_data:
+                update_data["display_order"] = contact_data["display_order"]
+            if "notes" in contact_data:
+                update_data["notes"] = contact_data["notes"]
+            
+            result = await self.database.contacts.update_one(
+                {"id": contact_id},
+                {"$set": update_data}
+            )
+            
+            return result.modified_count > 0
+            
+        except Exception as e:
+            print(f"Error updating contact {contact_id}: {e}")
+            return False
+    
+    async def delete_contact(self, contact_id: str):
+        """Delete a contact"""
+        try:
+            result = await self.database.contacts.delete_one({"id": contact_id})
+            return result.deleted_count > 0
+            
+        except Exception as e:
+            print(f"Error deleting contact {contact_id}: {e}")
+            return False
+    
+    async def get_public_contacts(self):
+        """Get public contacts for website display (organized by type)"""
+        try:
+            contacts = await self.get_all_contacts()
+            
+            # Group contacts by type for easy frontend consumption
+            contacts_by_type = {}
+            for contact in contacts:
+                contact_type = contact["contact_type"]
+                if contact_type not in contacts_by_type:
+                    contacts_by_type[contact_type] = []
+                contacts_by_type[contact_type].append({
+                    "label": contact["label"],
+                    "value": contact["value"],
+                    "display_order": contact["display_order"]
+                })
+            
+            # Sort each type by display_order
+            for contact_type in contacts_by_type:
+                contacts_by_type[contact_type].sort(key=lambda x: x["display_order"])
+            
+            return contacts_by_type
+            
+        except Exception as e:
+            print(f"Error getting public contacts: {e}")
+            return {}
+    
+    async def initialize_default_contacts(self):
+        """Initialize default contact information if none exists"""
+        try:
+            # Check if contacts already exist
+            existing_contacts = await self.database.contacts.count_documents({})
+            if existing_contacts > 0:
+                return
+            
+            # Default contact information
+            default_contacts = [
+                {
+                    "contact_type": "phone_support",
+                    "label": "Customer Support",
+                    "value": "+234 901 234 5678",
+                    "is_active": True,
+                    "display_order": 1,
+                    "notes": "Primary customer support line"
+                },
+                {
+                    "contact_type": "phone_business",
+                    "label": "Business Line",
+                    "value": "+234 901 234 5679",
+                    "is_active": True,
+                    "display_order": 2,
+                    "notes": "Business inquiries and partnerships"
+                },
+                {
+                    "contact_type": "email_support",
+                    "label": "Support Email",
+                    "value": "support@servicehub.ng",
+                    "is_active": True,
+                    "display_order": 1,
+                    "notes": "Customer support and technical issues"
+                },
+                {
+                    "contact_type": "email_business",
+                    "label": "Business Email",
+                    "value": "business@servicehub.ng",
+                    "is_active": True,
+                    "display_order": 2,
+                    "notes": "Business partnerships and corporate inquiries"
+                },
+                {
+                    "contact_type": "address_office",
+                    "label": "Head Office",
+                    "value": "123 Tech District, Victoria Island, Lagos, Nigeria",
+                    "is_active": True,
+                    "display_order": 1,
+                    "notes": "Main office location"
+                },
+                {
+                    "contact_type": "social_facebook",
+                    "label": "Facebook",
+                    "value": "https://facebook.com/servicehubng",
+                    "is_active": True,
+                    "display_order": 1,
+                    "notes": "Official Facebook page"
+                },
+                {
+                    "contact_type": "social_instagram",
+                    "label": "Instagram",
+                    "value": "https://instagram.com/servicehubng",
+                    "is_active": True,
+                    "display_order": 2,
+                    "notes": "Official Instagram account"
+                },
+                {
+                    "contact_type": "social_youtube",
+                    "label": "YouTube",
+                    "value": "https://youtube.com/@servicehubng",
+                    "is_active": True,
+                    "display_order": 3,
+                    "notes": "Official YouTube channel"
+                },
+                {
+                    "contact_type": "social_twitter",
+                    "label": "Twitter",
+                    "value": "https://twitter.com/servicehubng",
+                    "is_active": True,
+                    "display_order": 4,
+                    "notes": "Official Twitter account"
+                },
+                {
+                    "contact_type": "website_url",
+                    "label": "Website",
+                    "value": "https://servicehub.ng",
+                    "is_active": True,
+                    "display_order": 1,
+                    "notes": "Main website URL"
+                },
+                {
+                    "contact_type": "business_hours",
+                    "label": "Business Hours",
+                    "value": "Monday - Friday: 9:00 AM - 6:00 PM\nSaturday: 10:00 AM - 4:00 PM\nSunday: Closed",
+                    "is_active": True,
+                    "display_order": 1,
+                    "notes": "Standard operating hours"
+                }
+            ]
+            
+            # Insert default contacts
+            for contact_data in default_contacts:
+                await self.create_contact(contact_data, "system")
+            
+            print("Default contact information initialized")
+            
+        except Exception as e:
+            print(f"Error initializing default contacts: {e}")
+
+    # ==========================================
+    # ADMIN NOTIFICATION MANAGEMENT METHODS
+    # ==========================================
+    
+    async def get_admin_notifications(self, filters: dict = None, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get notifications for admin management with filtering"""
+        query = filters or {}
+        
+        cursor = self.notifications_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        
+        notifications = []
+        async for doc in cursor:
+            # Get user info for each notification
+            user = await self.get_user_by_id(doc["user_id"])
+            
+            notification = {
+                "id": str(doc["_id"]),
+                "user_id": doc["user_id"],
+                "user_name": user.get("name", "Unknown") if user else "Unknown",
+                "user_email": user.get("email", "Unknown") if user else "Unknown",
+                "type": doc["type"],
+                "channel": doc["channel"],
+                "status": doc["status"],
+                "subject": doc.get("subject", ""),
+                "content": doc.get("content", "")[:100] + "..." if len(doc.get("content", "")) > 100 else doc.get("content", ""),
+                "recipient_email": doc.get("recipient_email"),
+                "recipient_phone": doc.get("recipient_phone"),
+                "created_at": doc["created_at"],
+                "sent_at": doc.get("sent_at"),
+                "delivered_at": doc.get("delivered_at"),
+                "metadata": doc.get("metadata", {})
+            }
+            notifications.append(notification)
+        
+        return notifications
+    
+    async def get_notifications_count(self, filters: dict = None) -> int:
+        """Get count of notifications matching filters"""
+        query = filters or {}
+        return await self.notifications_collection.count_documents(query)
+    
+    async def get_notification_by_id(self, notification_id: str) -> Optional[dict]:
+        """Get detailed notification by ID"""
+        try:
+            from bson import ObjectId
+            doc = await self.notifications_collection.find_one({"_id": ObjectId(notification_id)})
+            
+            if doc:
+                # Get user info
+                user = await self.get_user_by_id(doc["user_id"])
+                
+                notification = {
+                    "id": str(doc["_id"]),
+                    "user_id": doc["user_id"],
+                    "user_name": user.get("name", "Unknown") if user else "Unknown",
+                    "user_email": user.get("email", "Unknown") if user else "Unknown",
+                    "user_role": user.get("role", "Unknown") if user else "Unknown",
+                    "type": doc["type"],
+                    "channel": doc["channel"],
+                    "status": doc["status"],
+                    "subject": doc.get("subject", ""),
+                    "content": doc.get("content", ""),
+                    "recipient_email": doc.get("recipient_email"),
+                    "recipient_phone": doc.get("recipient_phone"),
+                    "created_at": doc["created_at"],
+                    "sent_at": doc.get("sent_at"),
+                    "delivered_at": doc.get("delivered_at"),
+                    "metadata": doc.get("metadata", {}),
+                    "admin_notes": doc.get("admin_notes", "")
+                }
+                return notification
+        except Exception as e:
+            logger.error(f"Error getting notification {notification_id}: {str(e)}")
+        
+        return None
+    
+    async def update_notification_status_admin(self, notification_id: str, status: str, admin_notes: str = "") -> bool:
+        """Update notification status with admin notes"""
+        try:
+            from bson import ObjectId
+            update_data = {
+                "status": status,
+                "updated_at": datetime.utcnow(),
+                "admin_notes": admin_notes
+            }
+            
+            if status == "sent":
+                update_data["sent_at"] = datetime.utcnow()
+            elif status == "delivered":
+                update_data["delivered_at"] = datetime.utcnow()
+            
+            result = await self.notifications_collection.update_one(
+                {"_id": ObjectId(notification_id)},
+                {"$set": update_data}
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating notification status: {str(e)}")
+            return False
+    
+    async def resend_notification(self, notification_id: str) -> bool:
+        """Queue notification for resending"""
+        try:
+            from bson import ObjectId
+            result = await self.notifications_collection.update_one(
+                {"_id": ObjectId(notification_id), "status": {"$in": ["failed", "cancelled"]}},
+                {"$set": {
+                    "status": "pending",
+                    "updated_at": datetime.utcnow(),
+                    "resend_count": {"$inc": 1}
+                }}
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error resending notification: {str(e)}")
+            return False
+    
+    async def delete_notification_admin(self, notification_id: str) -> bool:
+        """Delete notification (admin only)"""
+        try:
+            from bson import ObjectId
+            result = await self.notifications_collection.delete_one({"_id": ObjectId(notification_id)})
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error deleting notification: {str(e)}")
+            return False
+    
+    # ==========================================
+    # NOTIFICATION TEMPLATES MANAGEMENT
+    # ==========================================
+    
+    async def get_all_notification_templates(self) -> List[dict]:
+        """Get all notification templates for admin management"""
+        # For now, return the built-in templates from the service
+        # In production, these could be stored in database for dynamic editing
+        try:
+            from services.notifications import NotificationTemplateService
+            template_service = NotificationTemplateService()
+            
+            templates = []
+            template_types = ["new_interest", "contact_shared", "job_posted", "payment_confirmation", "new_message"]
+            channels = ["email", "sms"]
+            
+            for template_type in template_types:
+                for channel in channels:
+                    template = template_service.get_template(template_type, channel)
+                    if template:
+                        templates.append({
+                            "id": template.id,
+                            "type": template.type,
+                            "channel": template.channel,
+                            "subject_template": template.subject_template,
+                            "content_template": template.content_template,
+                            "variables": template.variables
+                        })
+            
+            return templates
+        except Exception as e:
+            logger.error(f"Error getting notification templates: {str(e)}")
+            return []
+    
+    async def get_notification_template_by_id(self, template_id: str) -> Optional[dict]:
+        """Get specific notification template by ID"""
+        templates = await self.get_all_notification_templates()
+        return next((t for t in templates if t["id"] == template_id), None)
+    
+    async def update_notification_template(self, template_id: str, template_data: dict) -> bool:
+        """Update notification template (for now, just validate - templates are built-in)"""
+        # In production, templates could be stored in database for dynamic editing
+        template = await self.get_notification_template_by_id(template_id)
+        return template is not None
+    
+    async def create_notification_template(self, template_data: dict) -> Optional[str]:
+        """Create notification template (for now, return generated ID)"""
+        # In production, save to database
+        return str(uuid.uuid4())
+    
+    async def test_notification_template(self, template_id: str, test_data: dict) -> dict:
+        """Test notification template with sample data"""
+        try:
+            from services.notifications import NotificationTemplateService
+            template_service = NotificationTemplateService()
+            
+            template = await self.get_notification_template_by_id(template_id)
+            if not template:
+                raise Exception("Template not found")
+            
+            # Create template object for testing
+            from models.notifications import NotificationTemplate, NotificationType, NotificationChannel
+            test_template = NotificationTemplate(
+                id=template["id"],
+                type=NotificationType(template["type"]),
+                channel=NotificationChannel(template["channel"]),
+                subject_template=template["subject_template"],
+                content_template=template["content_template"],
+                variables=template["variables"]
+            )
+            
+            subject, content = template_service.render_template(test_template, test_data)
+            
+            return {
+                "subject": subject,
+                "content": content,
+                "variables_used": list(test_data.keys())
+            }
+        except Exception as e:
+            raise Exception(f"Template test failed: {str(e)}")
+    
+    # ==========================================
+    # NOTIFICATION PREFERENCES MANAGEMENT
+    # ==========================================
+    
+    async def get_all_user_preferences(self, skip: int = 0, limit: int = 50, user_role: str = None) -> List[dict]:
+        """Get all user notification preferences for admin review"""
+        # Build query
+        pipeline = [
+            {
+                "$lookup": {
+                    "from": "users",
+                    "localField": "user_id",
+                    "foreignField": "id",
+                    "as": "user"
+                }
+            },
+            {"$unwind": "$user"}
+        ]
+        
+        if user_role:
+            pipeline.append({"$match": {"user.role": user_role}})
+        
+        pipeline.extend([
+            {"$skip": skip},
+            {"$limit": limit},
+            {
+                "$project": {
+                    "user_id": 1,
+                    "user_name": "$user.name",
+                    "user_email": "$user.email",
+                    "user_role": "$user.role",
+                    "new_interest": 1,
+                    "contact_shared": 1,
+                    "job_posted": 1,
+                    "payment_confirmation": 1,
+                    "job_expiring": 1,
+                    "new_matching_job": 1,
+                    "new_message": 1,
+                    "created_at": 1,
+                    "updated_at": 1
+                }
+            }
+        ])
+        
+        preferences = await self.notification_preferences_collection.aggregate(pipeline).to_list(length=None)
+        
+        # Convert ObjectId to string
+        for pref in preferences:
+            pref["id"] = str(pref["_id"])
+            del pref["_id"]
+        
+        return preferences
+    
+    async def get_notification_preferences_stats(self) -> dict:
+        """Get aggregated notification preferences statistics"""
+        pipeline = [
+            {
+                "$group": {
+                    "_id": None,
+                    "total_users": {"$sum": 1},
+                    "email_only": {"$sum": {"$cond": [{"$eq": ["$new_interest", "email"]}, 1, 0]}},
+                    "sms_only": {"$sum": {"$cond": [{"$eq": ["$new_interest", "sms"]}, 1, 0]}},
+                    "both_channels": {"$sum": {"$cond": [{"$eq": ["$new_interest", "both"]}, 1, 0]}}
+                }
+            }
+        ]
+        
+        result = await self.notification_preferences_collection.aggregate(pipeline).to_list(1)
+        
+        if result:
+            return result[0]
+        else:
+            return {
+                "total_users": 0,
+                "email_only": 0,
+                "sms_only": 0,
+                "both_channels": 0
+            }
+    
+    async def update_user_notification_preferences_admin(self, user_id: str, preferences_data: dict) -> bool:
+        """Update user notification preferences (admin override)"""
+        preferences_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.notification_preferences_collection.update_one(
+            {"user_id": user_id},
+            {"$set": preferences_data}
+        )
+        
+        return result.modified_count > 0
+    
+    # ==========================================
+    # NOTIFICATION ANALYTICS
+    # ==========================================
+    
+    async def get_notification_analytics(self, date_from: str = None, date_to: str = None) -> dict:
+        """Get comprehensive notification analytics"""
+        match_stage = {}
+        
+        if date_from or date_to:
+            date_filter = {}
+            if date_from:
+                date_filter["$gte"] = datetime.fromisoformat(date_from)
+            if date_to:
+                date_filter["$lte"] = datetime.fromisoformat(date_to)
+            match_stage["created_at"] = date_filter
+        
+        pipeline = [
+            {"$match": match_stage},
+            {
+                "$group": {
+                    "_id": None,
+                    "total_notifications": {"$sum": 1},
+                    "sent_count": {"$sum": {"$cond": [{"$eq": ["$status", "sent"]}, 1, 0]}},
+                    "delivered_count": {"$sum": {"$cond": [{"$eq": ["$status", "delivered"]}, 1, 0]}},
+                    "failed_count": {"$sum": {"$cond": [{"$eq": ["$status", "failed"]}, 1, 0]}},
+                    "pending_count": {"$sum": {"$cond": [{"$eq": ["$status", "pending"]}, 1, 0]}},
+                    "email_count": {"$sum": {"$cond": [{"$eq": ["$channel", "email"]}, 1, 0]}},
+                    "sms_count": {"$sum": {"$cond": [{"$eq": ["$channel", "sms"]}, 1, 0]}},
+                    "both_count": {"$sum": {"$cond": [{"$eq": ["$channel", "both"]}, 1, 0]}}
+                }
+            }
+        ]
+        
+        result = await self.notifications_collection.aggregate(pipeline).to_list(1)
+        
+        if result:
+            analytics = result[0]
+            # Calculate delivery rate
+            total_sent = analytics["sent_count"] + analytics["delivered_count"]
+            analytics["delivery_rate"] = (total_sent / analytics["total_notifications"] * 100) if analytics["total_notifications"] > 0 else 0
+            return analytics
+        else:
+            return {
+                "total_notifications": 0,
+                "sent_count": 0,
+                "delivered_count": 0,
+                "failed_count": 0,
+                "pending_count": 0,
+                "email_count": 0,
+                "sms_count": 0,
+                "both_count": 0,
+                "delivery_rate": 0
+            }
+    
+    async def get_notification_delivery_report(self, notification_type: str = None, date_from: str = None, date_to: str = None) -> dict:
+        """Get detailed delivery report for notifications"""
+        match_stage = {}
+        
+        if notification_type:
+            match_stage["type"] = notification_type
+        
+        if date_from or date_to:
+            date_filter = {}
+            if date_from:
+                date_filter["$gte"] = datetime.fromisoformat(date_from)  
+            if date_to:
+                date_filter["$lte"] = datetime.fromisoformat(date_to)
+            match_stage["created_at"] = date_filter
+        
+        # Group by type and status
+        pipeline = [
+            {"$match": match_stage},
+            {
+                "$group": {
+                    "_id": {
+                        "type": "$type",
+                        "status": "$status",
+                        "channel": "$channel"
+                    },
+                    "count": {"$sum": 1}
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$_id.type",
+                    "channels": {
+                        "$push": {
+                            "channel": "$_id.channel",
+                            "status": "$_id.status",
+                            "count": "$count"
+                        }
+                    }
+                }
+            }
+        ]
+        
+        results = await self.notifications_collection.aggregate(pipeline).to_list(length=None)
+        
+        # Format results
+        report = {}
+        for result in results:
+            notification_type = result["_id"]
+            report[notification_type] = {
+                "channels": result["channels"],
+                "total": sum(channel["count"] for channel in result["channels"])
+            }
+        
+        return report
+    
+    # ==========================================
+    # TRADE CATEGORY QUESTIONS METHODS
+    # ==========================================
+    
+    async def create_trade_category_question(self, question_data: dict) -> dict:
+        """Create a new trade category question"""
+        try:
+            question_data['created_at'] = datetime.utcnow()
+            question_data['updated_at'] = datetime.utcnow()
+            
+            result = await self.database.trade_category_questions.insert_one(question_data)
+            if result.inserted_id:
+                question_data['_id'] = str(result.inserted_id)
+                return question_data
+            return None
+        except Exception as e:
+            logger.error(f"Error creating trade category question: {str(e)}")
+            return None
+    
+    async def get_questions_by_trade_category(self, trade_category: str) -> List[dict]:
+        """Get all active questions for a specific trade category"""
+        try:
+            questions = await self.database.trade_category_questions.find({
+                "trade_category": trade_category,
+                "is_active": True
+            }).sort("display_order", 1).to_list(length=None)
+            
+            for question in questions:
+                question['_id'] = str(question['_id'])
+            
+            return questions
+        except Exception as e:
+            logger.error(f"Error getting questions for trade category {trade_category}: {str(e)}")
+            return []
+    
+    async def get_all_trade_category_questions(self, trade_category: str = None) -> List[dict]:
+        """Get all questions (admin view) with optional trade category filter"""
+        try:
+            filters = {}
+            if trade_category:
+                filters["trade_category"] = trade_category
+            
+            questions = await self.database.trade_category_questions.find(filters).sort([
+                ("trade_category", 1), 
+                ("display_order", 1)
+            ]).to_list(length=None)
+            
+            for question in questions:
+                question['_id'] = str(question['_id'])
+            
+            return questions
+        except Exception as e:
+            logger.error(f"Error getting all trade category questions: {str(e)}")
+            return []
+    
+    async def get_trade_category_question_by_id(self, question_id: str) -> dict:
+        """Get a specific trade category question by ID"""
+        try:
+            question = await self.database.trade_category_questions.find_one({"id": question_id})
+            if question:
+                question['_id'] = str(question['_id'])
+            return question
+        except Exception as e:
+            logger.error(f"Error getting trade category question {question_id}: {str(e)}")
+            return None
+    
+    async def update_trade_category_question(self, question_id: str, update_data: dict) -> dict:
+        """Update a trade category question"""
+        try:
+            update_data['updated_at'] = datetime.utcnow()
+            
+            result = await self.database.trade_category_questions.update_one(
+                {"id": question_id},
+                {"$set": update_data}
+            )
+            
+            if result.modified_count > 0:
+                return await self.get_trade_category_question_by_id(question_id)
+            return None
+        except Exception as e:
+            logger.error(f"Error updating trade category question {question_id}: {str(e)}")
+            return None
+    
+    async def delete_trade_category_question(self, question_id: str) -> bool:
+        """Delete a trade category question"""
+        try:
+            result = await self.database.trade_category_questions.delete_one({"id": question_id})
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error deleting trade category question {question_id}: {str(e)}")
+            return False
+    
+    async def reorder_trade_category_questions(self, trade_category: str, question_orders: List[dict]) -> bool:
+        """Reorder questions for a trade category"""
+        try:
+            # question_orders should be [{"id": "question_id", "display_order": int}, ...]
+            for item in question_orders:
+                await self.database.trade_category_questions.update_one(
+                    {"id": item["id"], "trade_category": trade_category},
+                    {"$set": {"display_order": item["display_order"], "updated_at": datetime.utcnow()}}
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Error reordering questions for {trade_category}: {str(e)}")
+            return False
+    
+    async def save_job_question_answers(self, answers_data: dict) -> dict:
+        """Save answers to trade category questions for a job"""
+        try:
+            answers_data['created_at'] = datetime.utcnow()
+            
+            # Remove any existing answers for this job
+            await self.database.job_question_answers.delete_many({"job_id": answers_data["job_id"]})
+            
+            # Insert new answers
+            result = await self.database.job_question_answers.insert_one(answers_data)
+            if result.inserted_id:
+                answers_data['_id'] = str(result.inserted_id)
+                return answers_data
+            return None
+        except Exception as e:
+            logger.error(f"Error saving job question answers: {str(e)}")
+            return None
+    
+    async def get_job_question_answers(self, job_id: str) -> dict:
+        """Get answers to trade category questions for a job"""
+        try:
+            answers = await self.database.job_question_answers.find_one({"job_id": job_id})
+            if answers:
+                answers['_id'] = str(answers['_id'])
+            return answers
+        except Exception as e:
+            logger.error(f"Error getting job question answers for {job_id}: {str(e)}")
+            return None
+    
+    async def get_trade_categories_with_questions(self) -> List[dict]:
+        """Get all trade categories that have questions defined"""
+        try:
+            pipeline = [
+                {"$match": {"is_active": True}},
+                {"$group": {
+                    "_id": "$trade_category",
+                    "question_count": {"$sum": 1}
+                }},
+                {"$sort": {"_id": 1}}
+            ]
+            
+            results = await self.database.trade_category_questions.aggregate(pipeline).to_list(length=None)
+            
+            categories = []
+            for result in results:
+                categories.append({
+                    "trade_category": result["_id"],
+                    "question_count": result["question_count"]
+                })
+            
+            return categories
+        except Exception as e:
+            logger.error(f"Error getting trade categories with questions: {str(e)}")
+            return []
+
+    # ==========================================
+    # ADMIN MANAGEMENT METHODS
+    # ==========================================
+
+    async def create_admin(self, admin_data: dict) -> str:
+        """Create a new admin"""
+        result = await self.database.admins.insert_one(admin_data)
+        return admin_data["id"]
+
+    async def get_admin_by_id(self, admin_id: str) -> Optional[dict]:
+        """Get admin by ID"""
+        admin = await self.database.admins.find_one({"id": admin_id})
+        if admin:
+            admin['_id'] = str(admin['_id'])
+        return admin
+
+    async def get_admin_by_username(self, username: str) -> Optional[dict]:
+        """Get admin by username"""
+        admin = await self.database.admins.find_one({"username": username})
+        if admin:
+            admin['_id'] = str(admin['_id'])
+        return admin
+
+    async def get_admin_by_email(self, email: str) -> Optional[dict]:
+        """Get admin by email"""
+        admin = await self.database.admins.find_one({"email": email})
+        if admin:
+            admin['_id'] = str(admin['_id'])
+        return admin
+
+    async def get_all_admins(
+        self, 
+        skip: int = 0, 
+        limit: int = 50, 
+        role: Optional[AdminRole] = None, 
+        status: Optional[AdminStatus] = None
+    ) -> List[dict]:
+        """Get all admins with filtering"""
+        query = {}
+        if role:
+            query["role"] = role.value
+        if status:
+            query["status"] = status.value
+
+        cursor = self.database.admins.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        admins = await cursor.to_list(length=limit)
+        
+        for admin in admins:
+            admin['_id'] = str(admin['_id'])
+        return admins
+
+    async def get_admins_count(
+        self, 
+        role: Optional[AdminRole] = None, 
+        status: Optional[AdminStatus] = None
+    ) -> int:
+        """Get total count of admins"""
+        query = {}
+        if role:
+            query["role"] = role.value
+        if status:
+            query["status"] = status.value
+        
+        return await self.database.admins.count_documents(query)
+
+    async def update_admin(self, admin_id: str, update_data: dict) -> bool:
+        """Update admin data"""
+        result = await self.database.admins.update_one(
+            {"id": admin_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
+
+    async def update_admin_login(self, admin_id: str):
+        """Update admin's last login and increment login count"""
+        await self.database.admins.update_one(
+            {"id": admin_id},
+            {
+                "$set": {"last_login": datetime.utcnow()},
+                "$inc": {"login_count": 1}
+            }
+        )
+
+    async def increment_admin_failed_attempts(self, admin_id: str):
+        """Increment failed login attempts"""
+        result = await self.database.admins.find_one_and_update(
+            {"id": admin_id},
+            {"$inc": {"failed_login_attempts": 1}},
+            return_document=True
+        )
+        
+        # Lock account after 5 failed attempts
+        if result and result.get("failed_login_attempts", 0) >= 5:
+            lock_until = datetime.utcnow() + timedelta(minutes=30)
+            await self.database.admins.update_one(
+                {"id": admin_id},
+                {"$set": {"locked_until": lock_until}}
+            )
+
+    async def create_admin_activity(self, activity_data: dict):
+        """Create admin activity log entry"""
+        await self.database.admin_activities.insert_one(activity_data)
+
+    async def get_admin_activities(
+        self,
+        skip: int = 0,
+        limit: int = 50,
+        admin_id: Optional[str] = None,
+        activity_type: Optional[AdminActivityType] = None
+    ) -> List[dict]:
+        """Get admin activity logs"""
+        query = {}
+        if admin_id:
+            query["admin_id"] = admin_id
+        if activity_type:
+            query["activity_type"] = activity_type.value
+
+        cursor = self.database.admin_activities.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        activities = await cursor.to_list(length=limit)
+        
+        for activity in activities:
+            activity['_id'] = str(activity['_id'])
+        return activities
+
+    async def get_admin_activities_count(
+        self,
+        admin_id: Optional[str] = None,
+        activity_type: Optional[AdminActivityType] = None
+    ) -> int:
+        """Get count of admin activities"""
+        query = {}
+        if admin_id:
+            query["admin_id"] = admin_id
+        if activity_type:
+            query["activity_type"] = activity_type.value
+        
+        return await self.database.admin_activities.count_documents(query)
+
+    async def get_admin_stats(self) -> dict:
+        """Get admin statistics"""
+        # Total admins by role
+        pipeline = [
+            {"$group": {
+                "_id": "$role",
+                "count": {"$sum": 1}
+            }}
+        ]
+        
+        role_counts = {}
+        async for doc in self.database.admins.aggregate(pipeline):
+            role_counts[doc["_id"]] = doc["count"]
+        
+        # Active vs inactive admins
+        active_admins = await self.database.admins.count_documents({"status": AdminStatus.ACTIVE.value})
+        total_admins = await self.database.admins.count_documents({})
+        
+        # Recent activities
+        recent_activities = await self.database.admin_activities.count_documents({
+            "created_at": {"$gte": datetime.utcnow() - timedelta(days=7)}
+        })
+        
+        # Login statistics
+        pipeline = [
+            {"$group": {
+                "_id": None,
+                "total_logins": {"$sum": "$login_count"},
+                "avg_logins": {"$avg": "$login_count"}
+            }}
+        ]
+        
+        login_stats = await self.database.admins.aggregate(pipeline).to_list(1)
+        total_logins = login_stats[0]["total_logins"] if login_stats else 0
+        avg_logins = login_stats[0]["avg_logins"] if login_stats else 0
+
+        return {
+            "total_admins": total_admins,
+            "active_admins": active_admins,
+            "inactive_admins": total_admins - active_admins,
+            "role_distribution": role_counts,
+            "recent_activities": recent_activities,
+            "total_logins": total_logins,
+            "average_logins_per_admin": round(avg_logins, 1)
+        }
+
+    # ==========================================
+    # CONTENT MANAGEMENT METHODS
+    # ==========================================
+
+    async def create_content_item(self, content_data: dict) -> str:
+        """Create a new content item"""
+        result = await self.database.content_items.insert_one(content_data)
+        return content_data["id"]
+
+    async def get_content_items(self, filters: dict = None, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get content items with filtering"""
+        query = filters or {}
+        cursor = self.database.content_items.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        content_items = await cursor.to_list(length=limit)
+        
+        for item in content_items:
+            item['_id'] = str(item['_id'])
+        return content_items
+
+    async def get_content_items_count(self, filters: dict = None) -> int:
+        """Get count of content items"""
+        query = filters or {}
+        return await self.database.content_items.count_documents(query)
+
+    async def get_content_item_by_id(self, content_id: str) -> Optional[dict]:
+        """Get content item by ID"""
+        item = await self.database.content_items.find_one({"id": content_id})
+        if item:
+            item['_id'] = str(item['_id'])
+        return item
+
+    async def get_content_item_by_slug(self, slug: str) -> Optional[dict]:
+        """Get content item by slug"""
+        item = await self.database.content_items.find_one({"slug": slug})
+        if item:
+            item['_id'] = str(item['_id'])
+        return item
+
+    async def update_content_item(self, content_id: str, update_data: dict) -> bool:
+        """Update content item"""
+        result = await self.database.content_items.update_one(
+            {"id": content_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
+
+    async def bulk_update_content_items(self, content_ids: List[str], update_data: dict) -> int:
+        """Bulk update content items"""
+        result = await self.database.content_items.update_many(
+            {"id": {"$in": content_ids}},
+            {"$set": update_data}
+        )
+        return result.modified_count
+
+    async def get_content_statistics(self) -> dict:
+        """Get content statistics"""
+        try:
+            # Total counts by status
+            total_content = await self.database.content_items.count_documents({})
+            published_content = await self.database.content_items.count_documents({"status": "published"})
+            draft_content = await self.database.content_items.count_documents({"status": "draft"})
+            scheduled_content = await self.database.content_items.count_documents({"status": "scheduled"})
+            archived_content = await self.database.content_items.count_documents({"status": "archived"})
+
+            # Content by type
+            type_pipeline = [
+                {"$group": {"_id": "$content_type", "count": {"$sum": 1}}}
+            ]
+            content_by_type = {}
+            async for doc in self.database.content_items.aggregate(type_pipeline):
+                content_by_type[doc["_id"]] = doc["count"]
+
+            # Content by category
+            category_pipeline = [
+                {"$group": {"_id": "$category", "count": {"$sum": 1}}}
+            ]
+            content_by_category = {}
+            async for doc in self.database.content_items.aggregate(category_pipeline):
+                content_by_category[doc["_id"]] = doc["count"]
+
+            # Top performing content (by view count)
+            top_performing_cursor = self.database.content_items.find(
+                {"status": "published"},
+                {"title": 1, "content_type": 1, "view_count": 1, "created_at": 1}
+            ).sort("view_count", -1).limit(5)
+            
+            top_performing = []
+            async for doc in top_performing_cursor:
+                doc['_id'] = str(doc['_id'])
+                top_performing.append(doc)
+
+            # Recent activity (last 10 content items)
+            recent_cursor = self.database.content_items.find(
+                {},
+                {"title": 1, "content_type": 1, "status": 1, "created_at": 1, "updated_at": 1}
+            ).sort("updated_at", -1).limit(10)
+            
+            recent_activity = []
+            async for doc in recent_cursor:
+                doc['_id'] = str(doc['_id'])
+                recent_activity.append(doc)
+
+            return {
+                "total_content": total_content,
+                "published_content": published_content,
+                "draft_content": draft_content,
+                "scheduled_content": scheduled_content,
+                "archived_content": archived_content,
+                "content_by_type": content_by_type,
+                "content_by_category": content_by_category,
+                "top_performing": top_performing,
+                "recent_activity": recent_activity
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting content statistics: {str(e)}")
+            return {
+                "total_content": 0,
+                "published_content": 0,
+                "draft_content": 0,
+                "scheduled_content": 0,
+                "archived_content": 0,
+                "content_by_type": {},
+                "content_by_category": {},
+                "top_performing": [],
+                "recent_activity": []
+            }
+
+    async def get_content_analytics(self, content_id: str, days: int = 30) -> dict:
+        """Get analytics for a specific content item"""
+        try:
+            from datetime import timedelta
+            start_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Get analytics data (placeholder implementation)
+            analytics = await self.database.content_analytics.find({
+                "content_id": content_id,
+                "date": {"$gte": start_date}
+            }).to_list(length=None)
+            
+            # Aggregate data
+            total_views = sum(item.get("views", 0) for item in analytics)
+            total_unique_views = sum(item.get("unique_views", 0) for item in analytics)
+            total_likes = sum(item.get("likes", 0) for item in analytics)
+            total_shares = sum(item.get("shares", 0) for item in analytics)
+            
+            return {
+                "content_id": content_id,
+                "period_days": days,
+                "total_views": total_views,
+                "total_unique_views": total_unique_views,
+                "total_likes": total_likes,
+                "total_shares": total_shares,
+                "daily_data": analytics
+            }
+        except Exception as e:
+            logger.error(f"Error getting content analytics: {str(e)}")
+            return {
+                "content_id": content_id,
+                "period_days": days,
+                "total_views": 0,
+                "total_unique_views": 0,
+                "total_likes": 0,
+                "total_shares": 0,
+                "daily_data": []
+            }
+
+    async def create_content_template(self, template_data: dict) -> str:
+        """Create content template"""
+        result = await self.database.content_templates.insert_one(template_data)
+        return template_data["id"]
+
+    async def get_content_templates(self, content_type: str = None) -> List[dict]:
+        """Get content templates"""
+        query = {"is_active": True}
+        if content_type:
+            query["content_type"] = content_type
+        
+        cursor = self.database.content_templates.find(query).sort("created_at", -1)
+        templates = await cursor.to_list(length=None)
+        
+        for template in templates:
+            template['_id'] = str(template['_id'])
+        return templates
+
+    async def create_media_file(self, media_data: dict) -> str:
+        """Create media file record"""
+        result = await self.database.media_files.insert_one(media_data)
+        return media_data["id"]
+
+    async def get_media_files(self, filters: dict = None, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get media files with filtering"""
+        query = filters or {}
+        cursor = self.database.media_files.find(query).sort("upload_date", -1).skip(skip).limit(limit)
+        media_files = await cursor.to_list(length=limit)
+        
+        for file in media_files:
+            file['_id'] = str(file['_id'])
+        return media_files
+
+    async def get_media_files_count(self, filters: dict = None) -> int:
+        """Get count of media files"""
+        query = filters or {}
+        return await self.database.media_files.count_documents(query)
+
+    async def save_uploaded_file(self, file, folder: str = "general") -> str:
+        """Save uploaded file and return URL (placeholder implementation)"""
+        # This is a placeholder implementation
+        # In a real system, you would save to cloud storage (S3, etc.)
+        import os
+        import uuid
+        
+        # Create uploads directory if it doesn't exist
+        upload_dir = f"/app/uploads/{folder}"
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Generate unique filename
+        file_extension = file.filename.split('.')[-1]
+        unique_filename = f"{uuid.uuid4()}.{file_extension}"
+        file_path = os.path.join(upload_dir, unique_filename)
+        
+        # Save file
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Return URL (in production, this would be a CDN URL)
+        return f"/uploads/{folder}/{unique_filename}"
+
+    async def log_admin_activity(self, admin_id: str, admin_username: str, activity_type: str, 
+                                description: str, target_id: str = None, target_type: str = None, 
+                                metadata: dict = None):
+        """Log admin activity"""
+        activity_data = {
+            "id": str(uuid.uuid4()),
+            "admin_id": admin_id,
+            "admin_username": admin_username,
+            "activity_type": activity_type,
+            "description": description,
+            "target_id": target_id,
+            "target_type": target_type,
+            "metadata": metadata,
+            "created_at": datetime.utcnow()
+        }
+        await self.database.admin_activities.insert_one(activity_data)
+
+    async def increment_content_view_count(self, content_id: str):
+        """Increment view count for content item"""
+        await self.database.content_items.update_one(
+            {"id": content_id},
+            {"$inc": {"view_count": 1}}
+        )
+
+    async def increment_content_like_count(self, content_id: str):
+        """Increment like count for content item"""
+        await self.database.content_items.update_one(
+            {"id": content_id},
+            {"$inc": {"like_count": 1}}
+        )
+
+    async def increment_content_share_count(self, content_id: str):
+        """Increment share count for content item"""
+        await self.database.content_items.update_one(
+            {"id": content_id},
+            {"$inc": {"share_count": 1}}
+        )
+
+    # Job Management Database Methods
+
+    async def get_job_postings(self, filters: dict = None, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get job postings with filtering"""
+        query = filters or {}
+        cursor = self.database.content_items.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        job_postings = await cursor.to_list(length=limit)
+        
+        for job in job_postings:
+            job['_id'] = str(job['_id'])
+        return job_postings
+
+    async def get_job_postings_count(self, filters: dict = None) -> int:
+        """Get count of job postings"""
+        query = filters or {}
+        return await self.database.content_items.count_documents(query)
+
+    async def get_job_by_slug(self, slug: str) -> Optional[dict]:
+        """Get job posting by slug"""
+        job = await self.database.content_items.find_one({"slug": slug, "content_type": "job_posting"})
+        if job:
+            job['_id'] = str(job['_id'])
+        return job
+
+    async def create_job_application(self, application_data: dict) -> str:
+        """Create a new job application"""
+        result = await self.database.job_applications.insert_one(application_data)
+        return application_data["id"]
+
+    async def get_job_applications(self, filters: dict = None, skip: int = 0, limit: int = 50) -> List[dict]:
+        """Get job applications with filtering"""
+        query = filters or {}
+        cursor = self.database.job_applications.find(query).sort("applied_at", -1).skip(skip).limit(limit)
+        applications = await cursor.to_list(length=limit)
+        
+        for app in applications:
+            app['_id'] = str(app['_id'])
+        return applications
+
+    async def get_job_applications_count(self, filters: dict = None) -> int:
+        """Get count of job applications"""
+        query = filters or {}
+        return await self.database.job_applications.count_documents(query)
+
+    async def get_job_application_by_id(self, application_id: str) -> Optional[dict]:
+        """Get job application by ID"""
+        application = await self.database.job_applications.find_one({"id": application_id})
+        if application:
+            application['_id'] = str(application['_id'])
+        return application
+
+    async def update_job_application(self, application_id: str, update_data: dict) -> bool:
+        """Update job application"""
+        update_data['updated_at'] = datetime.utcnow()
+        result = await self.database.job_applications.update_one(
+            {"id": application_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
+
+    async def increment_job_applications_count(self, job_id: str):
+        """Increment applications count for a job posting"""
+        await self.database.content_items.update_one(
+            {"id": job_id, "content_type": "job_posting"},
+            {"$inc": {"settings.applications_count": 1}}
+        )
+
+    async def get_job_statistics(self) -> dict:
+        """Get job posting and application statistics"""
+        try:
+            # Job statistics
+            total_jobs = await self.database.content_items.count_documents({"content_type": "job_posting"})
+            active_jobs = await self.database.content_items.count_documents({
+                "content_type": "job_posting", 
+                "status": "published"
+            })
+            draft_jobs = await self.database.content_items.count_documents({
+                "content_type": "job_posting", 
+                "status": "draft"
+            })
+            
+            # Application statistics
+            total_applications = await self.database.job_applications.count_documents({})
+            
+            # Jobs by department aggregation
+            pipeline = [
+                {"$match": {"content_type": "job_posting"}},
+                {"$group": {
+                    "_id": "$settings.department",
+                    "count": {"$sum": 1}
+                }},
+                {"$sort": {"count": -1}}
+            ]
+            
+            jobs_by_department = {}
+            async for doc in self.database.content_items.aggregate(pipeline):
+                if doc["_id"]:
+                    jobs_by_department[doc["_id"]] = doc["count"]
+            
+            # Jobs by type aggregation
+            pipeline = [
+                {"$match": {"content_type": "job_posting"}},
+                {"$group": {
+                    "_id": "$settings.job_type",
+                    "count": {"$sum": 1}
+                }},
+                {"$sort": {"count": -1}}
+            ]
+            
+            jobs_by_type = {}
+            async for doc in self.database.content_items.aggregate(pipeline):
+                if doc["_id"]:
+                    jobs_by_type[doc["_id"]] = doc["count"]
+            
+            # Applications by status aggregation
+            pipeline = [
+                {"$group": {
+                    "_id": "$status",
+                    "count": {"$sum": 1}
+                }},
+                {"$sort": {"count": -1}}
+            ]
+            
+            applications_by_status = {}
+            async for doc in self.database.job_applications.aggregate(pipeline):
+                if doc["_id"]:
+                    applications_by_status[doc["_id"]] = doc["count"]
+            
+            # Top jobs by application count
+            pipeline = [
+                {"$match": {"content_type": "job_posting"}},
+                {"$sort": {"settings.applications_count": -1}},
+                {"$limit": 5},
+                {"$project": {
+                    "title": 1,
+                    "slug": 1,
+                    "department": "$settings.department",
+                    "applications_count": "$settings.applications_count",
+                    "status": 1,
+                    "created_at": 1
+                }}
+            ]
+            
+            top_jobs = []
+            async for job in self.database.content_items.aggregate(pipeline):
+                job["_id"] = str(job["_id"])
+                top_jobs.append(job)
+            
+            # Recent applications
+            recent_applications = await self.database.job_applications.find(
+                {}, 
+                {"name": 1, "job_title": 1, "status": 1, "applied_at": 1}
+            ).sort("applied_at", -1).limit(10).to_list(length=10)
+            
+            for app in recent_applications:
+                app["_id"] = str(app["_id"])
+            
+            return {
+                "total_jobs": total_jobs,
+                "active_jobs": active_jobs,
+                "draft_jobs": draft_jobs,
+                "expired_jobs": 0,  # Will implement expired logic later
+                "total_applications": total_applications,
+                "jobs_by_department": jobs_by_department,
+                "jobs_by_type": jobs_by_type,
+                "applications_by_status": applications_by_status,
+                "top_jobs": top_jobs,
+                "recent_applications": recent_applications
+            }
+        except Exception as e:
+            logger.error(f"Error getting job statistics: {str(e)}")
+            return {
+                "total_jobs": 0,
+                "active_jobs": 0,
+                "draft_jobs": 0,
+                "expired_jobs": 0,
+                "total_applications": 0,
+                "jobs_by_department": {},
+                "jobs_by_type": {},
+                "applications_by_status": {},
+                "top_jobs": [],
+                "recent_applications": []
+            }
+
+    async def get_admin_users(self) -> List[dict]:
+        """Get list of admin users for notifications"""
+        try:
+            cursor = self.database.admins.find(
+                {"status": "active"}, 
+                {"id": 1, "username": 1, "email": 1, "full_name": 1, "role": 1}
+            )
+            admins = await cursor.to_list(length=None)
+            
+            for admin in admins:
+                admin['_id'] = str(admin['_id'])
+            
+            return admins
+        except Exception as e:
+            logger.error(f"Error getting admin users: {str(e)}")
+            return []
+
+    # Hiring Status and Feedback Database Methods
+
+    async def create_hiring_status(self, hiring_status_data: dict) -> dict:
+        """Create a hiring status record"""
+        try:
+            result = await self.database.hiring_status.insert_one(hiring_status_data)
+            hiring_status_data['_id'] = str(result.inserted_id)
+            return hiring_status_data
+        except Exception as e:
+            logger.error(f"Error creating hiring status: {str(e)}")
+            raise
+
+    async def get_hiring_status_by_job_and_tradesperson(self, job_id: str, tradesperson_id: str) -> Optional[dict]:
+        """Get hiring status for specific job and tradesperson"""
+        try:
+            status = await self.database.hiring_status.find_one({
+                "job_id": job_id,
+                "tradesperson_id": tradesperson_id
+            })
+            if status:
+                status['_id'] = str(status['_id'])
+            return status
+        except Exception as e:
+            logger.error(f"Error getting hiring status: {str(e)}")
+            return None
+
+    async def update_hiring_status(self, status_id: str, update_data: dict) -> bool:
+        """Update hiring status"""
+        try:
+            update_data['updated_at'] = datetime.utcnow()
+            result = await self.database.hiring_status.update_one(
+                {"id": status_id},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating hiring status: {str(e)}")
+            return False
+
+    async def create_hiring_feedback(self, feedback_data: dict) -> dict:
+        """Create a hiring feedback record"""
+        try:
+            result = await self.database.hiring_feedback.insert_one(feedback_data)
+            feedback_data['_id'] = str(result.inserted_id)
+            return feedback_data
+        except Exception as e:
+            logger.error(f"Error creating hiring feedback: {str(e)}")
+            raise
+
+    async def get_hiring_feedback_by_job_and_tradesperson(self, job_id: str, tradesperson_id: str) -> Optional[dict]:
+        """Get hiring feedback for specific job and tradesperson"""
+        try:
+            feedback = await self.database.hiring_feedback.find_one({
+                "job_id": job_id,
+                "tradesperson_id": tradesperson_id
+            })
+            if feedback:
+                feedback['_id'] = str(feedback['_id'])
+            return feedback
+        except Exception as e:
+            logger.error(f"Error getting hiring feedback: {str(e)}")
+            return None
+
+    async def get_hiring_statistics(self) -> dict:
+        """Get hiring statistics for analytics"""
+        try:
+            # Count total hiring status records
+            total_interactions = await self.database.hiring_status.count_documents({})
+            
+            # Count hired vs not hired
+            hired_count = await self.database.hiring_status.count_documents({"hired": True})
+            not_hired_count = await self.database.hiring_status.count_documents({"hired": False})
+            
+            # Count by job status
+            pipeline = [
+                {"$match": {"hired": True}},
+                {"$group": {
+                    "_id": "$job_status",
+                    "count": {"$sum": 1}
+                }}
+            ]
+            job_status_counts = {}
+            async for doc in self.database.hiring_status.aggregate(pipeline):
+                if doc["_id"]:
+                    job_status_counts[doc["_id"]] = doc["count"]
+            
+            # Count feedback by type
+            pipeline = [
+                {"$group": {
+                    "_id": "$feedback_type",
+                    "count": {"$sum": 1}
+                }}
+            ]
+            feedback_type_counts = {}
+            async for doc in self.database.hiring_feedback.aggregate(pipeline):
+                if doc["_id"]:
+                    feedback_type_counts[doc["_id"]] = doc["count"]
+            
+            return {
+                "total_interactions": total_interactions,
+                "hired_count": hired_count,
+                "not_hired_count": not_hired_count,
+                "job_status_distribution": job_status_counts,
+                "feedback_type_distribution": feedback_type_counts,
+                "hiring_rate": hired_count / total_interactions if total_interactions > 0 else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting hiring statistics: {str(e)}")
+            return {
+                "total_interactions": 0,
+                "hired_count": 0,
+                "not_hired_count": 0,
+                "job_status_distribution": {},
+                "feedback_type_distribution": {},
+                "hiring_rate": 0
+            }
+
+    async def get_completed_jobs_for_tradesperson(self, tradesperson_id: str):
+        """Get all completed jobs for a tradesperson where they showed interest"""
+        try:
+            # Get all interests for this tradesperson where the job is completed
+            pipeline = [
+                # Match interests for this tradesperson
+                {"$match": {"tradesperson_id": tradesperson_id}},
+                
+                # Lookup the job details
+                {"$lookup": {
+                    "from": "jobs",
+                    "localField": "job_id", 
+                    "foreignField": "id",
+                    "as": "job"
+                }},
+                
+                # Only include if job exists and is completed
+                {"$match": {
+                    "job.status": "completed",
+                    "job": {"$ne": []}
+                }},
+                
+                # Flatten the job array
+                {"$unwind": "$job"},
+                
+                # Project the fields we need (excluding ObjectId fields)
+                {"$project": {
+                    "_id": 0,  # Exclude the MongoDB _id field
+                    "id": "$id",
+                    "job_id": "$job_id",
+                    "job_title": "$job.title",
+                    "job_description": "$job.description",
+                    "job_category": "$job.category",
+                    "job_location": "$job.location",
+                    "job_budget_min": "$job.budget_min",
+                    "job_budget_max": "$job.budget_max",
+                    "job_timeline": "$job.timeline",
+                    "job_status": "$job.status",
+                    "homeowner_id": "$job.homeowner.id",
+                    "homeowner_name": "$job.homeowner.name",
+                    "homeowner_email": "$job.homeowner.email",
+                    "homeowner_phone": "$job.homeowner.phone",
+                    "status": "$status",
+                    "created_at": "$created_at",
+                    "updated_at": "$updated_at",
+                    "completed_at": "$job.completed_at",
+                    "access_fee_naira": "$job.access_fee_naira",
+                    "access_fee_coins": "$job.access_fee_coins",
+                    "payment_made_at": "$payment_made_at",
+                    "rating": {"$ifNull": ["$rating", None]}
+                }},
+                
+                # Sort by completion date (most recent first)
+                {"$sort": {"completed_at": -1, "updated_at": -1}}
+            ]
+            
+            completed_jobs = []
+            async for job in self.database.interests.aggregate(pipeline):
+                # Clean the job data to ensure all fields are serializable
+                cleaned_job = self._clean_job_data(job)
+                completed_jobs.append(cleaned_job)
+            
+            logger.info(f"Retrieved {len(completed_jobs)} completed jobs for tradesperson {tradesperson_id}")
+            return completed_jobs
+            
+        except Exception as e:
+            logger.error(f"Error getting completed jobs for tradesperson {tradesperson_id}: {str(e)}")
+            raise e
+
+    async def get_interested_tradespeople_for_job(self, job_id: str):
+        """Get all tradespeople who showed interest in a specific job"""
+        try:
+            # Get all interests for this job with tradesperson details
+            pipeline = [
+                # Match interests for this job
+                {"$match": {"job_id": job_id}},
+                
+                # Lookup the tradesperson details
+                {"$lookup": {
+                    "from": "users",
+                    "localField": "tradesperson_id",
+                    "foreignField": "id",
+                    "as": "tradesperson"
+                }},
+                
+                # Only include if tradesperson exists
+                {"$match": {"tradesperson": {"$ne": []}}},
+                
+                # Flatten the tradesperson array
+                {"$unwind": "$tradesperson"},
+                
+                # Project the fields we need
+                {"$project": {
+                    "_id": 0,  # Exclude MongoDB _id
+                    "id": "$id",
+                    "job_id": "$job_id",
+                    "tradesperson_id": "$tradesperson_id",
+                    "status": "$status",
+                    "created_at": "$created_at",
+                    "updated_at": "$updated_at",
+                    "tradesperson": {
+                        "id": "$tradesperson.id",
+                        "name": "$tradesperson.name",
+                        "email": "$tradesperson.email",
+                        "phone": "$tradesperson.phone"
+                    }
+                }}
+            ]
+            
+            interested_tradespeople = []
+            async for interest in self.database.interests.aggregate(pipeline):
+                # Clean the interest data to ensure serialization
+                cleaned_interest = self._clean_job_data(interest)
+                interested_tradespeople.append(cleaned_interest)
+            
+            logger.info(f"Retrieved {len(interested_tradespeople)} interested tradespeople for job {job_id}")
+            return interested_tradespeople
+            
+        except Exception as e:
+            logger.error(f"Error getting interested tradespeople for job {job_id}: {str(e)}")
+            raise e
+
+    def _clean_job_data(self, job_data: dict) -> dict:
+        """Clean job data to ensure all fields are JSON serializable"""
+        from bson import ObjectId
+        from datetime import datetime
+        
+        cleaned = {}
+        for key, value in job_data.items():
+            if isinstance(value, ObjectId):
+                cleaned[key] = str(value)
+            elif isinstance(value, datetime):
+                cleaned[key] = value.isoformat()
+            elif isinstance(value, dict):
+                cleaned[key] = self._clean_job_data(value)
+            elif isinstance(value, list):
+                cleaned[key] = [self._clean_job_data(item) if isinstance(item, dict) else item for item in value]
+            else:
+                cleaned[key] = value
+        
+        return cleaned
+
+# Create global database instance
+database = Database()

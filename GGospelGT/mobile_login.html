@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mobile Login Helper</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            max-width: 400px; 
+            margin: 0 auto; 
+            padding: 20px; 
+            background-color: #f5f5f5;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }
+        .success { background-color: #d4edda; border-left: 4px solid #28a745; }
+        .error { background-color: #f8d7da; border-left: 4px solid #dc3545; }
+        .info { background-color: #d1ecf1; border-left: 4px solid #17a2b8; }
+        button {
+            background-color: #28a745;
+            color: white;
+            border: none;
+            padding: 15px 25px;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+            margin: 10px 0;
+        }
+        button:hover {
+            background-color: #218838;
+        }
+        .loading {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        h1 { color: #2F8140; text-align: center; }
+        h2 { color: #333; }
+    </style>
+</head>
+<body>
+    <h1>🔧 ServiceHub Mobile Login</h1>
+    
+    <div class="card info">
+        <h2>📱 Mobile Login Helper</h2>
+        <p>This page will automatically log you in to test the completed jobs functionality.</p>
+        <p><strong>Your Account:</strong> francisdaniel4jb@gmail.com</p>
+    </div>
+
+    <div id="status" class="card">
+        <h2>Status: Ready</h2>
+        <p>Click the button below to automatically login and test the My Jobs page.</p>
+    </div>
+
+    <button id="loginBtn" onclick="autoLogin()">🚀 Auto Login & Go to My Jobs</button>
+    
+    <button onclick="goToHomepage()" style="background-color: #007bff;">🏠 Go to Homepage</button>
+    
+    <button onclick="clearStorage()" style="background-color: #dc3545;">🗑️ Clear Login Data</button>
+
+    <div class="card info">
+        <h2>ℹ️ Instructions</h2>
+        <ol>
+            <li>Click "Auto Login & Go to My Jobs"</li>
+            <li>Wait for the success message</li>
+            <li>You'll be automatically redirected to test the completed jobs functionality</li>
+        </ol>
+    </div>
+
+    <script>
+        function updateStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = `card ${type}`;
+            statusDiv.innerHTML = `<h2>${type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️'} ${message}</h2>`;
+        }
+
+        function setButtonLoading(loading) {
+            const btn = document.getElementById('loginBtn');
+            if (loading) {
+                btn.textContent = '⏳ Logging in...';
+                btn.className = 'loading';
+                btn.disabled = true;
+            } else {
+                btn.textContent = '🚀 Auto Login & Go to My Jobs';
+                btn.className = '';
+                btn.disabled = false;
+            }
+        }
+
+        async function autoLogin() {
+            setButtonLoading(true);
+            updateStatus('Attempting to login...', 'info');
+
+            try {
+                // Step 1: Get a fresh token from the backend
+                updateStatus('Step 1: Getting authentication token...', 'info');
+                
+                const loginResponse = await fetch('http://10.219.64.152:8001/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        email: 'francisdaniel4jb@gmail.com',
+                        password: 'FixedPassword123!'
+                    })
+                });
+
+                if (!loginResponse.ok) {
+                    const errorData = await loginResponse.json();
+                    throw new Error(`Login failed: ${errorData.detail || 'Unknown error'}`);
+                }
+
+                const loginData = await loginResponse.json();
+                
+                if (!loginData.access_token) {
+                    throw new Error('No access token received');
+                }
+
+                // Step 2: Store the token
+                updateStatus('Step 2: Storing authentication data...', 'info');
+                localStorage.setItem('token', loginData.access_token);
+                
+                // Also store user data if available
+                if (loginData.user) {
+                    localStorage.setItem('user', JSON.stringify(loginData.user));
+                }
+
+                // Step 3: Verify the token works
+                updateStatus('Step 3: Verifying authentication...', 'info');
+                
+                const verifyResponse = await fetch('http://10.219.64.152:8001/api/auth/me', {
+                    headers: {
+                        'Authorization': `Bearer ${loginData.access_token}`
+                    }
+                });
+
+                if (!verifyResponse.ok) {
+                    throw new Error('Token verification failed');
+                }
+
+                const userData = await verifyResponse.json();
+
+                // Step 4: Success!
+                updateStatus(`Success! Logged in as ${userData.name} (${userData.role})`, 'success');
+                
+                // Step 5: Redirect to My Jobs page
+                setTimeout(() => {
+                    updateStatus('Redirecting to My Jobs page...', 'success');
+                    window.location.href = '/my-jobs';
+                }, 2000);
+
+            } catch (error) {
+                updateStatus(`Login failed: ${error.message}`, 'error');
+                setButtonLoading(false);
+            }
+        }
+
+        function goToHomepage() {
+            window.location.href = '/';
+        }
+
+        function clearStorage() {
+            localStorage.removeItem('token');
+            localStorage.removeItem('user');
+            updateStatus('Login data cleared. You are now logged out.', 'info');
+        }
+
+        // Check if already logged in
+        window.onload = function() {
+            const token = localStorage.getItem('token');
+            if (token) {
+                updateStatus('You appear to be already logged in!', 'success');
+            }
+        };
+    </script>
+</body>
+</html>

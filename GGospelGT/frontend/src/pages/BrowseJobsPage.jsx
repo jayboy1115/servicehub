@@ -1,0 +1,1046 @@
+import React, { useState, useEffect } from 'react';
+import Header from '../components/Header';
+import Footer from '../components/Footer';
+import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
+import { Button } from '../components/ui/button';
+import { Badge } from '../components/ui/badge';
+import { 
+  MapPin, 
+  Calendar, 
+  DollarSign, 
+  Clock, 
+  User, 
+  Search,
+  Filter,
+  Briefcase,
+  HandHeart,
+  Heart,
+  Map,
+  List,
+  Navigation,
+  Settings,
+  Crosshair
+} from 'lucide-react';
+import { jobsAPI, interestsAPI } from '../api/services';
+import { walletAPI, tradeCategoryQuestionsAPI } from '../api/wallet';
+import { useAuth } from '../contexts/AuthContext';
+import { useToast } from '../hooks/use-toast';
+import { useNavigate, useLocation } from 'react-router-dom';
+import JobsMap from '../components/maps/JobsMap';
+import LocationSettingsModal from '../components/LocationSettingsModal';
+import { authAPI } from '../api/services';
+
+// Nigerian Trade Categories
+const NIGERIAN_TRADE_CATEGORIES = [
+  "Building",
+  "Electrical Repairs", 
+  "Painting",
+  "Plumbing",
+  "Tiling",
+  "Generator Services",
+  "Air Conditioning & Refrigeration",
+  "Welding",
+  "Carpentry",
+  "General Handyman Work",
+  "Roofing",
+  "Cleaning",
+  "Solar & Inverter Installation",
+  "Bathroom Fitting",
+  "Flooring",
+  "Furniture Making",
+  "Interior Design"
+];
+
+const BrowseJobsPage = () => {
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showingInterest, setShowingInterest] = useState(null);
+  const [pagination, setPagination] = useState(null);
+  const [walletBalance, setWalletBalance] = useState(null);
+  const [viewMode, setViewMode] = useState('list'); // 'list' or 'map'
+  const [selectedJobId, setSelectedJobId] = useState(null);
+  const [selectedJobDetails, setSelectedJobDetails] = useState(null);
+  const [selectedJobAnswers, setSelectedJobAnswers] = useState(null);
+  const [showJobModal, setShowJobModal] = useState(false);
+  const [userLocation, setUserLocation] = useState(null);
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [showLocationSettings, setShowLocationSettings] = useState(false);
+  const [loadingStates, setLoadingStates] = useState({
+    showInterest: {}
+  });
+  const [userInterests, setUserInterests] = useState(null);
+  const [userInterestsLoading, setUserInterestsLoading] = useState(false);
+
+  const { user, isAuthenticated, isTradesperson } = useAuth();
+  const location = useLocation();
+  
+  // Load user interests for tradespeople
+  const loadUserInterests = async () => {
+    if (!isAuthenticated() || !isTradesperson()) return;
+    
+    try {
+      setUserInterestsLoading(true);
+      const interests = await interestsAPI.getMyInterests();
+      // Extract job IDs from interests
+      const jobIds = interests.map(interest => interest.job_id);
+      setUserInterests(jobIds);
+    } catch (error) {
+      console.error('Failed to load user interests:', error);
+      setUserInterests([]);
+    } finally {
+      setUserInterestsLoading(false);
+    }
+  };
+  
+  const [filters, setFilters] = useState({
+    search: '',
+    category: '',
+    useLocation: false,
+    maxDistance: user?.travel_distance_km || 25
+  });
+  const { toast } = useToast();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!isAuthenticated() || !isTradesperson()) {
+      return;
+    }
+    loadWalletBalance();
+    loadUserLocationData();
+    loadUserInterests(); // Load user's existing interests
+  }, [isAuthenticated, isTradesperson]); // Add authentication dependencies
+
+  useEffect(() => {
+    if (isAuthenticated() && isTradesperson()) {
+      loadJobsBasedOnFilters();
+    }
+  }, [filters, userLocation, isAuthenticated, isTradesperson]); // Add authentication dependencies
+
+  // Show welcome message for new registrations
+  useEffect(() => {
+    if (location.state?.welcomeMessage) {
+      toast({
+        title: "Registration Successful! 🎉",
+        description: location.state.welcomeMessage,
+        duration: 5000,
+      });
+
+      // Show additional wallet funding info if applicable
+      if (location.state?.walletFunded && location.state?.fundingAmount) {
+        setTimeout(() => {
+          toast({
+            title: "Wallet Funding Submitted",
+            description: `Your payment of ₦${location.state.fundingAmount} has been submitted for verification. You'll be notified once approved.`,
+            duration: 5000,
+          });
+        }, 1000);
+      } else if (location.state?.walletError) {
+        setTimeout(() => {
+          toast({
+            title: "Note",
+            description: "You can fund your wallet anytime from the Wallet page to start applying for jobs.",
+            variant: "info",
+          });
+        }, 1000);
+      } else if (location.state?.showWalletReminder) {
+        // Show reminder for users who chose "Set Up Wallet Later"
+        setTimeout(() => {
+          toast({
+            title: "Complete Your Setup 💳",
+            description: "Ready to start applying for jobs? Visit the Wallet page to fund your account and access homeowner contact details.",
+            duration: 6000,
+          });
+        }, 2000);
+      }
+
+      // Clear the state to prevent showing message again on refresh
+      navigate(location.pathname, { replace: true, state: {} });
+    }
+  }, [location.state, toast, navigate]);
+
+  const loadWalletBalance = async () => {
+    try {
+      const data = await walletAPI.getBalance();
+      setWalletBalance(data);
+    } catch (error) {
+      console.error('Failed to load wallet balance:', error);
+    }
+  };
+
+  const loadUserLocationData = () => {
+    // Check if user has saved location
+    if (user?.latitude && user?.longitude) {
+      setUserLocation({ lat: user.latitude, lng: user.longitude });
+      setFilters(prev => ({ 
+        ...prev, 
+        maxDistance: user.travel_distance_km || 25,
+        useLocation: true 
+      }));
+    }
+  };
+
+  const loadJobsBasedOnFilters = async (page = 1) => {
+    try {
+      setLoading(true);
+      let response;
+
+      if (filters.useLocation && userLocation) {
+        // Use location-based job fetching
+        const params = new URLSearchParams({
+          latitude: userLocation.lat.toString(),
+          longitude: userLocation.lng.toString(),
+          max_distance_km: filters.maxDistance.toString(),
+          limit: '50',
+          skip: ((page - 1) * 50).toString()
+        });
+
+        if (filters.search) params.append('q', filters.search);
+        if (filters.category) params.append('category', filters.category);
+
+        const url = filters.search || filters.category 
+          ? `/jobs/search?${params.toString()}`
+          : `/jobs/nearby?${params.toString()}`;
+
+        response = await jobsAPI.apiClient.get(url);
+      } else {
+        // Use regular job fetching for tradespeople
+        const skip = (page - 1) * 50;
+        response = await jobsAPI.apiClient.get(`/jobs/for-tradesperson?limit=50&skip=${skip}`);
+      }
+
+      setJobs(response.data.jobs || []);
+      setPagination(response.data.pagination || null);
+    } catch (error) {
+      console.error('Failed to load jobs:', error);
+      toast({
+        title: "Failed to load jobs",
+        description: "There was an error loading available jobs. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getCurrentLocation = () => {
+    if (!navigator.geolocation) {
+      toast({
+        title: "Location not supported",
+        description: "Your browser doesn't support geolocation",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    setLocationLoading(true);
+    
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const location = {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude
+        };
+        
+        setUserLocation(location);
+        setFilters(prev => ({ ...prev, useLocation: true }));
+        setLocationLoading(false);
+        
+        toast({
+          title: "Location updated",
+          description: "Now showing jobs near your current location"
+        });
+      },
+      (error) => {
+        console.error('Error getting location:', error);
+        setLocationLoading(false);
+        toast({
+          title: "Location error",
+          description: "Unable to get your current location",
+          variant: "destructive"
+        });
+      }
+    );
+  };
+
+  const updateLocationSettings = async (latitude, longitude, travelDistance) => {
+    try {
+      const params = new URLSearchParams({
+        latitude: latitude.toString(),
+        longitude: longitude.toString(),
+        travel_distance_km: travelDistance.toString()
+      });
+
+      await jobsAPI.apiClient.put(`/auth/profile/location?${params.toString()}`);
+      
+      setUserLocation({ lat: latitude, lng: longitude });
+      setFilters(prev => ({ 
+        ...prev, 
+        maxDistance: travelDistance,
+        useLocation: true 
+      }));
+      
+      toast({
+        title: "Location settings saved",
+        description: "Your location and travel preferences have been updated"
+      });
+      
+      setShowLocationSettings(false);
+    } catch (error) {
+      console.error('Failed to update location settings:', error);
+      toast({
+        title: "Error",
+        description: "Failed to update location settings",
+        variant: "destructive"
+      });
+    }
+  };
+
+  const handleShowInterest = async (job) => {
+    if (!isAuthenticated()) {
+      toast({
+        title: "Sign in required",
+        description: "Please sign in to show interest in jobs.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!isTradesperson()) {
+      toast({
+        title: "Tradesperson account required",
+        description: "Only tradespeople can show interest in jobs.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Client-side validation: Check if job is still active
+    if (job.status && job.status !== "active") {
+      toast({
+        title: "Job no longer available",
+        description: "This job is no longer accepting new interest.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Client-side validation: Check if already interested
+    if (userInterests && userInterests.includes(job.id)) {
+      toast({
+        title: "Already interested",
+        description: "You have already shown interest in this job.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Check wallet balance for potential access fee
+    const accessFeeCoins = job.access_fee_coins || 15;
+    if (walletBalance && walletBalance.balance_coins < accessFeeCoins) {
+      toast({
+        title: "Insufficient wallet balance",
+        description: `You need at least ${accessFeeCoins} coins (₦${(accessFeeCoins * 100).toLocaleString()}) to pay for contact details. Please fund your wallet.`,
+        variant: "destructive",
+      });
+      navigate('/wallet');
+      return;
+    }
+
+    try {
+      setShowingInterest(job.id);
+      await interestsAPI.showInterest(job.id);
+      
+      // Update local state to reflect the new interest
+      if (userInterests) {
+        setUserInterests([...userInterests, job.id]);
+      } else {
+        setUserInterests([job.id]);
+      }
+      
+      toast({
+        title: "Interest registered!",
+        description: "The homeowner will review your profile and may share their contact details.",
+      });
+
+    } catch (error) {
+      console.error('Failed to show interest:', error);
+      
+      // Handle different error response formats with more specific messages
+      let errorMessage = "There was an error showing interest. Please try again.";
+      
+      if (error.response?.data?.detail) {
+        const detail = error.response.data.detail;
+        
+        // Handle specific backend validation errors
+        if (typeof detail === 'string') {
+          if (detail.includes('already shown interest')) {
+            errorMessage = "You have already shown interest in this job.";
+            // Update local state to prevent future attempts
+            if (userInterests) {
+              setUserInterests([...userInterests, job.id]);
+            } else {
+              setUserInterests([job.id]);
+            }
+          } else if (detail.includes('no longer active')) {
+            errorMessage = "This job is no longer available.";
+          } else if (detail.includes('not found')) {
+            errorMessage = "This job could not be found.";
+          } else {
+            errorMessage = detail;
+          }
+        } else if (Array.isArray(detail)) {
+          // Handle FastAPI validation errors which return an array
+          errorMessage = detail.map(err => err.msg || err.message || JSON.stringify(err)).join(', ');
+        } else if (typeof detail === 'object') {
+          // Handle object error details
+          errorMessage = detail.msg || detail.message || JSON.stringify(detail);
+        }
+      }
+      
+      toast({
+        title: "Failed to show interest",
+        description: errorMessage,
+        variant: "destructive",
+      });
+      
+      // Re-throw the error so modal can catch it and stay open
+      throw error;
+    } finally {
+      setShowingInterest(null);
+    }
+  };
+
+  const formatCurrency = (value) => {
+    return new Intl.NumberFormat('en-NG', {
+      style: 'currency',
+      currency: 'NGN',
+      minimumFractionDigits: 0
+    }).format(value);
+  };
+
+  const handleViewJobDetails = async (job) => {
+    setSelectedJobDetails(job);
+    setSelectedJobAnswers(null); // Reset previous answers
+    setShowJobModal(true);
+    
+    // Fetch job question answers
+    try {
+      const answers = await tradeCategoryQuestionsAPI.getJobQuestionAnswers(job.id);
+      if (answers && answers.answers && answers.answers.length > 0) {
+        setSelectedJobAnswers(answers);
+      }
+    } catch (error) {
+      console.error('Failed to fetch job question answers:', error);
+      // Don't show error to user, just continue without answers
+    }
+  };
+
+  const formatDate = (dateString) => {
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffTime = Math.abs(now - date);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays === 1) return '1 day ago';
+    if (diffDays < 7) return `${diffDays} days ago`;
+    if (diffDays < 30) return `${Math.floor(diffDays / 7)} weeks ago`;
+    return `${Math.floor(diffDays / 30)} months ago`;
+  };
+
+  const getTimeAgo = (dateString) => {
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffTime = Math.abs(now - date);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays === 1) return '1 day ago';
+    if (diffDays < 7) return `${diffDays} days ago`;
+    if (diffDays < 30) return `${Math.floor(diffDays / 7)} weeks ago`;
+    return `${Math.floor(diffDays / 30)} months ago`;
+  };
+
+
+
+  if (!isAuthenticated()) {
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <Header />
+        <div className="container mx-auto px-4 py-16">
+          <div className="max-w-md mx-auto text-center">
+            <h1 className="text-2xl font-bold font-montserrat mb-4" style={{color: '#121E3C'}}>
+              Sign In Required
+            </h1>
+            <p className="text-gray-600 font-lato mb-6">
+              Please sign in to browse available jobs and submit quotes.
+            </p>
+            <Button 
+              onClick={() => window.location.reload()}
+              className="text-white font-lato"
+              style={{backgroundColor: '#2F8140'}}
+            >
+              Sign In
+            </Button>
+          </div>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  if (!isTradesperson()) {
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <Header />
+        <div className="container mx-auto px-4 py-16">
+          <div className="max-w-md mx-auto text-center">
+            <h1 className="text-2xl font-bold font-montserrat mb-4" style={{color: '#121E3C'}}>
+              Tradesperson Access Only
+            </h1>
+            <p className="text-gray-600 font-lato mb-6">
+              This page is only available to registered tradespeople.
+            </p>
+          </div>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <Header />
+      
+      {/* Page Header */}
+      <section className="py-8 bg-white border-b">
+        <div className="container mx-auto px-4">
+          <div className="max-w-4xl mx-auto">
+            <h1 className="text-3xl font-bold font-montserrat mb-4" style={{color: '#121E3C'}}>
+              Available Jobs
+            </h1>
+            <p className="text-lg text-gray-600 font-lato">
+              Browse jobs that match your skills and show your interest to homeowners.
+            </p>
+            
+            {/* Search and Filters */}
+            <div className="mt-6 space-y-4">
+              {/* Search Bar */}
+              <div className="flex flex-col sm:flex-row gap-4">
+                <div className="flex-1 relative">
+                  <Search size={20} className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" />
+                  <input
+                    type="text"
+                    placeholder="Search jobs by title, description, or location..."
+                    value={filters.search}
+                    onChange={(e) => setFilters(prev => ({ ...prev, search: e.target.value }))}
+                    className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent font-lato"
+                  />
+                </div>
+                
+                <select
+                  value={filters.category}
+                  onChange={(e) => setFilters(prev => ({ ...prev, category: e.target.value }))}
+                  className="px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent font-lato"
+                >
+                  <option value="">All Categories</option>
+                  {NIGERIAN_TRADE_CATEGORIES.map((category) => (
+                    <option key={category} value={category}>
+                      {category}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Location and View Controls */}
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                {/* Location Controls */}
+                <div className="flex items-center space-x-3">
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="checkbox"
+                      id="useLocation"
+                      checked={filters.useLocation}
+                      onChange={(e) => setFilters(prev => ({ ...prev, useLocation: e.target.checked }))}
+                      className="h-4 w-4 text-green-600 focus:ring-green-500 border-gray-300 rounded"
+                    />
+                    <label htmlFor="useLocation" className="text-sm font-medium text-gray-700 font-lato">
+                      Filter by location
+                    </label>
+                  </div>
+
+                  {filters.useLocation && (
+                    <>
+                      <div className="flex items-center space-x-2">
+                        <span className="text-sm text-gray-600 font-lato">Within</span>
+                        <input
+                          type="range"
+                          min="5"
+                          max="100"
+                          value={filters.maxDistance}
+                          onChange={(e) => setFilters(prev => ({ ...prev, maxDistance: parseInt(e.target.value) }))}
+                          className="w-20"
+                        />
+                        <span className="text-sm font-medium text-gray-700 font-lato w-8">
+                          {filters.maxDistance}km
+                        </span>
+                      </div>
+
+                      <button
+                        onClick={getCurrentLocation}
+                        disabled={locationLoading}
+                        className="flex items-center space-x-1 px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 text-white rounded-lg text-sm font-lato"
+                      >
+                        <Crosshair size={14} />
+                        <span>{locationLoading ? 'Getting...' : 'Use GPS'}</span>
+                      </button>
+
+                      <button
+                        onClick={() => setShowLocationSettings(true)}
+                        className="flex items-center space-x-1 px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded-lg text-sm font-lato"
+                      >
+                        <Settings size={14} />
+                        <span>Settings</span>
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {/* View Toggle */}
+                <div className="flex items-center bg-gray-100 rounded-lg p-1">
+                  <button
+                    onClick={() => setViewMode('list')}
+                    className={`flex items-center space-x-1 px-3 py-2 rounded-md text-sm font-lato transition-colors ${
+                      viewMode === 'list'
+                        ? 'bg-white text-gray-900 shadow-sm'
+                        : 'text-gray-600 hover:text-gray-900'
+                    }`}
+                  >
+                    <List size={16} />
+                    <span>List</span>
+                  </button>
+                  <button
+                    onClick={() => setViewMode('map')}
+                    className={`flex items-center space-x-1 px-3 py-2 rounded-md text-sm font-lato transition-colors ${
+                      viewMode === 'map'
+                        ? 'bg-white text-gray-900 shadow-sm'
+                        : 'text-gray-600 hover:text-gray-900'
+                    }`}
+                  >
+                    <Map size={16} />
+                    <span>Map</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Location Status */}
+              {userLocation && filters.useLocation && (
+                <div className="bg-green-50 border border-green-200 rounded-lg p-3">
+                  <div className="flex items-center space-x-2">
+                    <Navigation size={16} className="text-green-600" />
+                    <span className="text-sm text-green-800 font-lato">
+                      Showing jobs within {filters.maxDistance}km of your location
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Wallet Balance & User Skills */}
+            <div className="mt-6 grid md:grid-cols-2 gap-6">
+              {/* Wallet Balance */}
+              {/* Wallet Balance - Only visible to tradespeople */}
+              {isTradesperson() && walletBalance && (
+                <div className="bg-gradient-to-r from-green-50 to-blue-50 p-4 rounded-lg border">
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <p className="text-sm font-medium text-gray-700 font-lato">Wallet Balance</p>
+                      <p className="text-2xl font-bold text-green-600 font-montserrat">
+                        {walletBalance.balance_coins} coins
+                      </p>
+                      <p className="text-sm text-gray-600 font-lato">
+                        ₦{walletBalance.balance_naira.toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <Button
+                        onClick={() => navigate('/wallet')}
+                        className="text-white font-lato text-sm px-3 py-1"
+                        style={{backgroundColor: '#2F8140'}}
+                      >
+                        Manage Wallet
+                      </Button>
+                      {walletBalance.balance_coins < 15 && (
+                        <p className="text-xs text-yellow-600 mt-1">
+                          ⚠️ Low balance
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* User skills display */}
+              {user?.trade_categories && (
+                <div>
+                  <p className="text-sm font-medium text-gray-700 font-lato mb-2">Your Skills:</p>
+                  <div className="flex flex-wrap gap-2">
+                    {user.trade_categories.map((category, index) => (
+                      <Badge key={index} className="bg-green-100 text-green-800">
+                        {category}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Jobs Display */}
+      <section className="py-8">
+        <div className="container mx-auto px-4">
+          <div className="max-w-4xl mx-auto">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-2xl font-bold font-montserrat" style={{color: '#121E3C'}}>
+                Available Jobs
+              </h2>
+              {jobs.length > 0 && (
+                <p className="text-gray-600 font-lato">
+                  {jobs.length} job{jobs.length !== 1 ? 's' : ''} found
+                  {viewMode === 'map' && ` • ${viewMode} view`}
+                </p>
+              )}
+            </div>
+
+            {/* Jobs Filtering Info */}
+            {isTradesperson() && user?.trade_categories && (
+              <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                <div className="flex items-center gap-2 mb-2">
+                  <Filter className="w-4 h-4 text-blue-600" />
+                  <span className="text-sm font-medium text-blue-800">Smart Job Filtering Active</span>
+                </div>
+                <div className="text-sm text-blue-700">
+                  <p className="mb-1">
+                    <strong>Skills Match:</strong> Showing jobs that match your skills: {user.trade_categories.join(', ')}
+                  </p>
+                  {filters.useLocation && userLocation && (
+                    <p>
+                      <strong>Location Filter:</strong> Within {filters.maxDistance}km of your location
+                    </p>
+                  )}
+                  {!filters.useLocation && (
+                    <p className="text-orange-600">
+                      💡 <strong>Tip:</strong> Enable location filtering to see jobs near you first
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Map View */}
+            {viewMode === 'map' && (
+              <div className="mb-6">
+                <JobsMap
+                  jobs={jobs}
+                  selectedJobId={selectedJobId}
+                  onJobSelect={(job) => setSelectedJobId(job.id)}
+                  userLocation={userLocation}
+                  showUserLocation={!!userLocation}
+                  height="500px"
+                />
+              </div>
+            )}
+            {/* Jobs List View */}
+            {viewMode === 'list' && (
+              <>
+                {loading ? (
+                  <div className="space-y-6">
+                    {Array.from({ length: 3 }).map((_, index) => (
+                      <Card key={index} className="animate-pulse">
+                        <CardContent className="p-6">
+                          <div className="h-6 bg-gray-200 rounded mb-4"></div>
+                          <div className="h-4 bg-gray-200 rounded mb-2"></div>
+                          <div className="h-4 bg-gray-200 rounded w-3/4"></div>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                ) : jobs.length === 0 ? (
+                  <Card>
+                    <CardContent className="text-center py-16">
+                      <Briefcase size={64} className="mx-auto text-gray-400 mb-4" />
+                      <h3 className="text-xl font-semibold font-montserrat text-gray-900 mb-2">
+                        No available jobs right now
+                      </h3>
+                      <p className="text-gray-600 font-lato mb-6">
+                        {user?.trade_categories?.length 
+                          ? "There are no jobs matching your skills at the moment. Check back later!"
+                          : "Complete your profile with your trade categories to see relevant jobs."
+                        }
+                      </p>
+                      <Button 
+                        onClick={() => loadJobsBasedOnFilters()}
+                        className="text-white font-lato"
+                        style={{backgroundColor: '#2F8140'}}
+                      >
+                        Refresh Jobs
+                      </Button>
+                    </CardContent>
+                  </Card>
+                ) : (
+                  <div className="space-y-4">
+                    {jobs.map((job) => (
+                      <Card 
+                        key={job.id} 
+                        className="hover:shadow-md transition-shadow duration-200 cursor-pointer border-l-4 border-l-transparent hover:border-l-purple-500"
+                        onClick={() => handleViewJobDetails(job)}
+                      >
+                        <CardContent className="p-4">
+                          {/* Top row with category, location, and time */}
+                          <div className="flex items-center justify-between text-sm text-gray-600 mb-3">
+                            <div className="flex items-center space-x-4">
+                              <span className="flex items-center">
+                                🔨 {job.category}
+                              </span>
+                              <span className="flex items-center">
+                                📍 {job.location}
+                                {job.distance_km && (
+                                  <span className="ml-1 text-blue-600 font-medium">
+                                    ({job.distance_km}km away)
+                                  </span>
+                                )}
+                              </span>
+                              <span className="flex items-center">
+                                🕐 {formatDate(job.created_at)}
+                              </span>
+                            </div>
+                            {/* Skills match indicator */}
+                            {user?.trade_categories?.some(skill => 
+                              skill.toLowerCase() === job.category.toLowerCase()
+                            ) && (
+                              <Badge className="bg-green-100 text-green-800 text-xs">
+                                ✓ Skills Match
+                              </Badge>
+                            )}
+                          </div>
+
+                          {/* Job title */}
+                          <h3 className="text-lg font-semibold text-purple-900 leading-tight mb-3">
+                            {job.title}
+                          </h3>
+
+                          {/* Show Interest Button */}
+                          <div className="flex justify-end">
+                            <Button
+                              onClick={(e) => {
+                                e.stopPropagation(); // Prevent card click
+                                handleShowInterest(job);
+                              }}
+                              disabled={showingInterest === job.id}
+                              className="text-white font-lato"
+                              style={{backgroundColor: '#2F8140'}}
+                            >
+                              {showingInterest === job.id ? 'Showing Interest...' : 'Show Interest'}
+                            </Button>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    ))}
+
+                    {/* Pagination */}
+                    {pagination && pagination.pages > 1 && (
+                      <div className="flex justify-center space-x-2 mt-8">
+                        {Array.from({ length: pagination.pages }, (_, i) => i + 1).map(page => (
+                          <Button
+                            key={page}
+                            variant={page === pagination.page ? "default" : "outline"}
+                            onClick={() => loadJobsBasedOnFilters(page)}
+                            className="font-lato"
+                            style={page === pagination.page ? {backgroundColor: '#2F8140', color: 'white'} : {}}
+                          >
+                            {page}
+                          </Button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Job Details Modal */}
+      {showJobModal && selectedJobDetails && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b p-6 z-10">
+              <div className="flex justify-between items-center">
+                <div>
+                  <h2 className="text-2xl font-bold font-montserrat" style={{color: '#121E3C'}}>
+                    {selectedJobDetails.title}
+                  </h2>
+                  <Badge className="bg-blue-100 text-blue-800 mt-2">
+                    {selectedJobDetails.category}
+                  </Badge>
+                </div>
+                <button
+                  onClick={() => setShowJobModal(false)}
+                  className="text-gray-500 hover:text-gray-700 text-xl"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6">
+              {/* Job Overview */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                <div>
+                  <h3 className="font-semibold mb-3 font-montserrat">Job Details</h3>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex items-center">
+                      <MapPin size={16} className="mr-2 text-gray-500" />
+                      <span><strong>Location:</strong> {selectedJobDetails.location}</span>
+                    </div>
+                    <div className="flex items-center">
+                      <Calendar size={16} className="mr-2 text-gray-500" />
+                      <span><strong>Posted:</strong> {formatDate(selectedJobDetails.created_at)}</span>
+                    </div>
+                    <div className="flex items-center">
+                      <Clock size={16} className="mr-2 text-gray-500" />
+                      <span><strong>Timeline:</strong> {selectedJobDetails.timeline || 'Flexible'}</span>
+                    </div>
+                    <div className="flex items-center">
+                      <Heart size={16} className="mr-2 text-gray-500" />
+                      <span><strong>Interest:</strong> {selectedJobDetails.interests_count || 0} tradespeople interested</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="font-semibold mb-3 font-montserrat">Budget & Payment</h3>
+                  <div className="space-y-3">
+                    {selectedJobDetails.budget_min && selectedJobDetails.budget_max ? (
+                      <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                        <div className="text-2xl font-bold font-montserrat" style={{color: '#2F8140'}}>
+                          {formatCurrency(selectedJobDetails.budget_min)} - {formatCurrency(selectedJobDetails.budget_max)}
+                        </div>
+                        <div className="text-sm text-gray-600">Budget Range</div>
+                      </div>
+                    ) : (
+                      <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                        <div className="text-lg font-medium text-gray-700">Budget Negotiable</div>
+                        <div className="text-sm text-gray-600">Discuss pricing with homeowner</div>
+                      </div>
+                    )}
+
+                    {/* Access Fee - Only visible to tradespeople */}
+                    {isTradesperson() && (
+                      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                        <div className="font-semibold text-yellow-800">
+                          Access Fee: {selectedJobDetails.access_fee_coins || 10} coins
+                        </div>
+                        <div className="text-sm text-yellow-600">
+                          ₦{(selectedJobDetails.access_fee_naira || 1000).toLocaleString()} for contact details
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Job Requirements & Details from Trade Category Questions */}
+              {selectedJobAnswers && selectedJobAnswers.answers && selectedJobAnswers.answers.length > 0 && (
+                <div className="mb-6">
+                  <h3 className="font-semibold mb-3 font-montserrat">Job Requirements & Details</h3>
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-4 space-y-3">
+                    {selectedJobAnswers.answers.map((answer, index) => (
+                      <div key={index} className="border-b border-green-200 last:border-b-0 pb-3 last:pb-0">
+                        <div className="font-medium text-gray-800 font-lato mb-1">
+                          {answer.question_text}
+                        </div>
+                        <div className="text-gray-700 font-lato pl-3">
+                          <span className="inline-block w-2 h-2 bg-green-500 rounded-full mr-2"></span>
+                          {answer.answer_text || answer.answer_value}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500 font-lato">
+                    Specific requirements provided by the homeowner
+                  </div>
+                </div>
+              )}
+
+              {/* Action Buttons */}
+              <div className="flex justify-between items-center pt-6 border-t">
+                <div className="text-sm text-gray-500 font-lato">
+                  Posted {getTimeAgo(selectedJobDetails.created_at)}
+                </div>
+                
+                <div className="flex space-x-3">
+                  <Button
+                    variant="outline"
+                    onClick={() => setShowJobModal(false)}
+                  >
+                    Close
+                  </Button>
+                  <Button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      try {
+                        await handleShowInterest(selectedJobDetails); // Wait for API call to complete
+                        setShowJobModal(false); // Only close modal on success
+                      } catch (error) {
+                        // Keep modal open on error so user can retry
+                        console.error('Show interest failed, keeping modal open:', error);
+                      }
+                    }}
+                    disabled={loadingStates.showInterest[selectedJobDetails.id] || 
+                             (userInterests && userInterests.includes(selectedJobDetails.id))}
+                    className="text-white font-lato"
+                    style={{backgroundColor: '#2F8140'}}
+                  >
+                    {loadingStates.showInterest[selectedJobDetails.id] ? (
+                      <>
+                        <Clock size={16} className="mr-2 animate-spin" />
+                        Processing...
+                      </>
+                    ) : userInterests && userInterests.includes(selectedJobDetails.id) ? (
+                      <>
+                        <HandHeart size={16} className="mr-2" />
+                        Already Interested
+                      </>
+                    ) : (
+                      <>
+                        <Heart size={16} className="mr-2" />
+                        Show Interest
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <Footer />
+      
+      {/* Location Settings Modal */}
+      <LocationSettingsModal
+        isOpen={showLocationSettings}
+        onClose={() => setShowLocationSettings(false)}
+        onSave={updateLocationSettings}
+        currentLocation={userLocation}
+        currentTravelDistance={filters.maxDistance}
+      />
+    </div>
+  );
+};
+
+export default BrowseJobsPage;
