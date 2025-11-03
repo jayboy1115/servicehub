@@ -1,0 +1,6 @@
+{
+  "installCommand": "cd GGospelGT/frontend && npm install",
+  "buildCommand": "cd GGospelGT/frontend && npm run build",
+  "outputDirectory": "GGospelGT/frontend/build",
+  "framework": "create-react-app"
+}
