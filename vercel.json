@@ -1,5 +1,5 @@
 {
-  "installCommand": "if [ -d GGospelGT/frontend ]; then cd GGospelGT/frontend; elif [ -d frontend ]; then cd frontend; else echo 'frontend directory not found'; exit 1; fi; npm install",
+  "installCommand": "if [ -d GGospelGT/frontend ]; then cd GGospelGT/frontend; elif [ -d frontend ]; then cd frontend; else echo 'frontend directory not found'; exit 1; fi; npm install --legacy-peer-deps",
   "buildCommand": "if [ -d GGospelGT/frontend ]; then cd GGospelGT/frontend; elif [ -d frontend ]; then cd frontend; else echo 'frontend directory not found'; exit 1; fi; npm run build",
   "framework": "create-react-app"
 }
