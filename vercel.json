@@ -1,6 +1,5 @@
 {
-  "installCommand": "cd GGospelGT/frontend && npm install",
-  "buildCommand": "cd GGospelGT/frontend && npm run build",
-  "outputDirectory": "GGospelGT/frontend/build",
+  "installCommand": "if [ -d GGospelGT/frontend ]; then cd GGospelGT/frontend; elif [ -d frontend ]; then cd frontend; else echo 'frontend directory not found'; exit 1; fi; npm install",
+  "buildCommand": "if [ -d GGospelGT/frontend ]; then cd GGospelGT/frontend; elif [ -d frontend ]; then cd frontend; else echo 'frontend directory not found'; exit 1; fi; npm run build",
   "framework": "create-react-app"
 }
